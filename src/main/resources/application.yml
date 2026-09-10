@@ -3,10 +3,21 @@ spring:
     name: ai-code-review-agent
 
   ai:
-    ollama:
-      base-url: http://localhost:11434
+    model:
+      chat: anthropic
+
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY}
+      #base-url: https://api.anthropic.com/v1
       chat:
-        model: qwen2.5-coder:7b
+        options:
+          model: claude-haiku-4-5
+          temperature: 0.1
+          max-tokens: 800
 
 server:
   port: 8080
+
+logging:
+  level:
+    org.springframework.ai: DEBUG
