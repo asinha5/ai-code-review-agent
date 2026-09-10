@@ -1,77 +1,430 @@
 # Architecture
 
-## Scope
+## 1. Purpose
 
-The current application is a synchronous Spring Boot REST service for reviewing a local repository with Anthropic Claude through Spring AI. Repository access is exposed to the model through a constrained tool layer.
+The AI Code Review Agent is designed as a learning-focused agentic application.
 
-## Implemented components
+Instead of sending an entire repository to an LLM in one prompt, the model receives a small set of repository tools and autonomously decides how to inspect the code.
 
-| Component | Responsibility |
-| --- | --- |
-| `AiConnectionController` | Exposes test, inspection, and structured review endpoints; builds prompts; registers tools; extracts JSON; converts the result. |
-| `ReviewContextManager` | Validates a repository directory, creates a UUID `reviewId`, and keeps the review-to-root mapping in memory. |
-| `ReviewContext` | Associates a `reviewId` with its normalized, absolute repository root. |
-| `RepositoryTools` | Provides `listFiles`, `readFile`, and `searchCode` to the model and logs their execution. |
-| `CodeReviewResponse` | Defines the structured summary and findings collection. |
-| `CodeReviewFinding` | Defines severity, category, location, issue, evidence, recommendation, and confidence fields. |
-
-## Review execution flow
+This makes the system genuinely tool-driven:
 
 ```text
-Request
-→ ReviewContext creation
-→ AI model decides which repository tools to call
-→ Tool execution
-→ Observation returned to model
-→ Further tool calls as needed
-→ Evidence-based findings
-→ Structured CodeReviewResponse
+Goal
+ |
+ v
+LLM decides next action
+ |
+ +--> tool call
+ |      |
+ |      v
+ |   observation
+ |      |
+ +------+
+ |
+ v
+final structured review
 ```
 
-Spring AI's `ToolCallAdvisor` and `ToolCallingManager` support the iterative tool-call cycle. The application makes the tools available, while the model decides which tools to invoke and when it has sufficient evidence to stop.
-
-## Repository access boundary
-
-An incoming `repositoryPath` is converted to a normalized absolute path and validated as an existing directory. The resulting root is registered under a generated `reviewId`.
-
-Every path-based tool call supplies that `reviewId` and a repository-relative path. `RepositoryTools` resolves and normalizes the path against the registered root, then rejects any result that does not remain beneath that root. This prevents `..` path traversal from escaping the selected repository.
-
-`listFiles` omits configured ignored directories from directory results. `searchCode` recursively excludes ignored paths and searches selected text formats: Java, XML, YAML, properties, Markdown, and JSON. Search results are capped at 100 matches. `readFile` reads a specified regular text file.
-
-Ignored directories are:
+## 2. High-Level Architecture
 
 ```text
-.git, .idea, .vscode, .mvn, target, node_modules, build, dist
+                         +-------------------+
+                         |   React UI        |
+                         |   planned         |
+                         +---------+---------+
+                                   |
+                          REST / future SSE
+                                   |
+                                   v
+                         +-------------------+
+                         | API Layer         |
+                         | CodeReviewController
+                         +---------+---------+
+                                   |
+                                   v
+                         +-------------------+
+                         | Review Layer      |
+                         | CodeReviewService |
+                         +----+----------+---+
+                              |          |
+                 creates      |          | publishes
+                 context      |          | activities
+                              v          v
+                    +---------------+   +----------------------+
+                    | ReviewContext |   | ReviewActivity       |
+                    | Manager       |   | Publisher / Store    |
+                    +-------+-------+   +----------------------+
+                            |
+                            | reviewId -> repositoryRoot
+                            |
+                            v
+                  +----------------------+
+                  | Spring AI ChatClient |
+                  +----------+-----------+
+                             |
+                             v
+                     +---------------+
+                     | LLM Provider  |
+                     +-------+-------+
+                             |
+                     native tool calls
+                             |
+                             v
+                  +----------------------+
+                  | RepositoryTools      |
+                  +----------+-----------+
+                             |
+                             v
+                  +----------------------+
+                  | Local Repository     |
+                  +----------------------+
 ```
 
-## Review contract
+## 3. API Layer
 
-The review prompt requires inspected evidence, prohibits invented line numbers, excludes weak findings, and defines severity and confidence criteria. Findings with low confidence are not requested. The structured contract is:
+The API package owns HTTP concerns.
+
+It should know about:
+
+- request payloads
+- response payloads
+- path variables
+- status codes
+- future SSE endpoints
+
+It should not own:
+
+- AI prompt logic
+- repository traversal
+- file access
+- tool security
+- model orchestration
+
+This keeps the controller thin.
+
+## 4. Review / Orchestration Layer
+
+`CodeReviewService` coordinates a review.
+
+Current sequence:
+
+```text
+validate repository path
+        |
+        v
+create ReviewContext
+        |
+        v
+publish REVIEW_STARTED
+        |
+        v
+build structured-output prompt
+        |
+        v
+publish ANALYZING
+        |
+        v
+invoke ChatClient with RepositoryTools
+        |
+        v
+model/tool loop executes
+        |
+        v
+extract final JSON
+        |
+        v
+convert to CodeReviewResponse
+        |
+        v
+publish REVIEW_COMPLETED
+```
+
+Any exception results in `REVIEW_FAILED`.
+
+The service intentionally does not directly perform filesystem operations.
+
+## 5. Review Context
+
+A review context contains:
+
+```text
+reviewId
+repositoryRoot
+```
+
+Example:
+
+```text
+reviewId = 22ac1541-874a-4c0f-8960-6b803636d68c
+repositoryRoot = C:\...\some-project
+```
+
+The LLM receives only the `reviewId` and relative paths when calling repository tools.
+
+This provides two benefits:
+
+1. The model does not repeatedly generate or manipulate the absolute root path.
+2. Filesystem access can be validated server-side.
+
+## 6. Tool Layer
+
+`RepositoryTools` is the controlled boundary between the AI and the local filesystem.
+
+Current tools:
+
+```text
+getRepositoryTree(reviewId)
+listFiles(reviewId, relativePath)
+readFile(reviewId, relativePath)
+searchCode(reviewId, searchTerm)
+```
+
+The tool methods are exposed to Spring AI with `@Tool`.
+
+Parameters use `@ToolParam` descriptions to make the tool contract explicit to the model.
+
+### Why `getRepositoryTree` exists
+
+Originally the agent explored repositories with multiple calls:
+
+```text
+.
+src
+src/main
+src/main/java
+...
+```
+
+This worked but consumed unnecessary model input tokens.
+
+`getRepositoryTree` provides coarse-grained discovery in one call:
+
+```text
+Repository tree
+     |
+     v
+Agent selects relevant files
+     |
+     +--> readFile
+     +--> searchCode
+```
+
+This reduces repetitive tool calls.
+
+## 7. Secure Path Resolution
+
+For file-oriented tools:
+
+```java
+repositoryRoot
+        .resolve(relativePath)
+        .normalize();
+```
+
+Then:
+
+```java
+if (!resolved.startsWith(repositoryRoot)) {
+    throw new IllegalArgumentException(...);
+}
+```
+
+Conceptually:
+
+```text
+AI asks for relative path
+        |
+        v
+server resolves path
+        |
+        v
+normalize
+        |
+        v
+inside configured root?
+     /       \
+   yes       no
+    |         |
+ allow      reject
+```
+
+## 8. Structured Output
+
+The model returns a structured review rather than arbitrary prose.
 
 ```text
 CodeReviewResponse
-├── summary
-└── findings[]
-    ├── severity
-    ├── category
-    ├── file
-    ├── line
-    ├── issue
-    ├── evidence
-    ├── recommendation
-    └── confidence
+ |
+ +-- summary
+ |
+ +-- findings[]
+       |
+       +-- severity
+       +-- category
+       +-- file
+       +-- line
+       +-- issue
+       +-- evidence
+       +-- recommendation
+       +-- confidence
 ```
 
-`BeanOutputConverter` supplies the model's format instructions and converts its result. Because model output can include prose around the object, the controller first extracts the substring from the first `{` through the last `}`. Conversion remains best-effort and invalid or absent JSON raises an error.
+`BeanOutputConverter<CodeReviewResponse>` supplies the expected output structure to the model and converts the final JSON into Java records.
 
-## Operational characteristics
+A small `extractJson()` method currently protects against responses that contain surrounding prose.
 
-- Tool calls and the raw review response are logged.
-- Review contexts live only in the application process and have no cleanup lifecycle.
-- Requests and responses are synchronous.
-- Postman is the current manual API testing workflow.
+It does not repair truncated or malformed JSON.
 
-## Planned architecture
+## 9. Review Activity Architecture
 
-SSE streaming, a React/Vite client, MCP, Git diff or PR review, orchestration enhancements, and durable persistence are not implemented. Planned work is tracked in [ROADMAP.md](ROADMAP.md).
+Review activity is intentionally separate from technical logging.
 
+```text
+Business / agent action
+        |
+        v
+ReviewActivityPublisher
+        |
+        v
+ReviewActivityEvent
+        |
+        +--> application log
+        |
+        +--> in-memory activity store
+        |
+        +--> future SSE subscribers
+```
+
+Current event types include:
+
+- REVIEW_STARTED
+- REPOSITORY_INSPECTION
+- FILE_READING
+- CODE_SEARCH
+- ANALYZING
+- GENERATING_FINDINGS
+- REVIEW_COMPLETED
+- REVIEW_FAILED
+
+The event message describes an observable action, not the model's private reasoning.
+
+Examples:
+
+```text
+Inspecting repository structure
+Reading file: src/main/java/.../CodeReviewService.java
+Searching code for: ChatClient
+Code review completed
+```
+
+## 10. Why Publisher and Store Are Separate Interfaces
+
+Two responsibilities are exposed:
+
+```text
+ReviewActivityPublisher
+        |
+        +--> write events
+
+ReviewActivityStore
+        |
+        +--> read / clear events
+```
+
+The current implementation supports both interfaces.
+
+This gives callers a narrow dependency:
+
+- `CodeReviewService` and `RepositoryTools` need to publish.
+- API/SSE code needs to read or subscribe.
+- Neither side needs to know the concrete implementation.
+
+## 11. Logging vs Activity Events vs Langfuse
+
+The project uses three different observability concepts.
+
+### SLF4J
+
+Purpose:
+
+- application diagnostics
+- exceptions
+- tool invocation debugging
+- developer troubleshooting
+
+### ReviewActivityEvent
+
+Purpose:
+
+- user-visible progress
+- future React activity timeline
+- concise review lifecycle events
+
+### Langfuse — planned
+
+Purpose:
+
+- AI trace
+- model invocation
+- latency
+- tool usage
+- token usage
+- errors
+- model/provider cost
+
+These should remain separate.
+
+## 12. Current State Management
+
+Current state is intentionally in memory.
+
+```text
+ReviewContextManager
+    -> active review context
+
+DefaultReviewActivityPublisher
+    -> activity events by reviewId
+```
+
+No database is required yet.
+
+Persistence can be introduced later only when review history becomes a real requirement.
+
+## 13. Future SSE Flow
+
+Planned:
+
+```text
+React
+ |
+ | GET /api/reviews/{reviewId}/stream
+ |
+ v
+SseEmitter
+ |
+ v
+Review activity subscriber
+ |
+ v
+ReviewActivityPublisher
+```
+
+The important architectural rule is that `RepositoryTools` should never depend directly on `SseEmitter`.
+
+The domain publishes an activity event; transport code decides how to deliver it.
+
+## 14. Future MCP Direction
+
+Native Spring AI tools are being implemented first so the mechanics of tool calling are clear.
+
+Later, repository access can be exposed through MCP:
+
+```text
+Current:
+LLM -> Spring AI @Tool -> RepositoryTools
+
+Future experiment:
+LLM -> MCP client -> MCP repository/filesystem server
+```
+
+This will allow a direct comparison of native tools versus MCP rather than treating MCP as magic infrastructure.
