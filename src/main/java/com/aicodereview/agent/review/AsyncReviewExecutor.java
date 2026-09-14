@@ -10,7 +10,11 @@ import org.springframework.stereotype.Service;
 
 import com.aicodereview.agent.activity.ReviewActivityPublisher;
 import com.aicodereview.agent.activity.ReviewActivityType;
+import com.aicodereview.agent.observability.ReviewTracingService;
 import com.aicodereview.agent.tool.RepositoryTools;
+
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 
 @Service
 public class AsyncReviewExecutor {
@@ -22,17 +26,23 @@ public class AsyncReviewExecutor {
     private final RepositoryTools repositoryTools;
     private final ReviewExecutionStore reviewExecutionStore;
     private final ReviewActivityPublisher reviewActivityPublisher;
+    private final ReviewTracingService reviewTracingService;
+    private final Tracer tracer;
 
     public AsyncReviewExecutor(
             ChatClient.Builder chatClientBuilder,
             RepositoryTools repositoryTools,
             ReviewExecutionStore reviewExecutionStore,
-            ReviewActivityPublisher reviewActivityPublisher) {
+            ReviewActivityPublisher reviewActivityPublisher,
+            ReviewTracingService reviewTracingService,
+            Tracer tracer) {
 
         this.chatClient = chatClientBuilder.build();
         this.repositoryTools = repositoryTools;
         this.reviewExecutionStore = reviewExecutionStore;
         this.reviewActivityPublisher = reviewActivityPublisher;
+        this.reviewTracingService = reviewTracingService;
+        this.tracer = tracer;
     }
 
     @Async
@@ -42,7 +52,18 @@ public class AsyncReviewExecutor {
         String reviewId =
                 reviewContext.reviewId();
 
-        try {
+        String repositoryName =
+                reviewContext.repositoryRoot()
+                        .getFileName()
+                        .toString();
+
+        Span span =
+                reviewTracingService.startReviewSpan(
+                        reviewId,
+                        repositoryName);
+
+        try (Tracer.SpanInScope ignored =
+                     tracer.withSpan(span)) {
 
             reviewExecutionStore.save(
                     new ReviewExecution(
@@ -78,10 +99,16 @@ public class AsyncReviewExecutor {
                         "AI returned no ChatResponse");
             }
 
+            log.info(
+                    "AI response metadata | reviewId={} | metadata={}",
+                    reviewId,
+                    chatResponse.getMetadata());
+
             String rawResponse = null;
 
             if (chatResponse.getResult() != null
-                    && chatResponse.getResult().getOutput() != null) {
+                    && chatResponse.getResult()
+                            .getOutput() != null) {
 
                 rawResponse =
                         chatResponse
@@ -89,6 +116,13 @@ public class AsyncReviewExecutor {
                                 .getOutput()
                                 .getText();
             }
+
+            log.info(
+                    "AI response received | reviewId={} | length={}",
+                    reviewId,
+                    rawResponse != null
+                            ? rawResponse.length()
+                            : 0);
 
             reviewActivityPublisher.publish(
                     reviewId,
@@ -102,9 +136,15 @@ public class AsyncReviewExecutor {
                     converter.convert(jsonResponse);
 
             if (response == null) {
+
                 throw new IllegalStateException(
                         "Unable to convert AI response into CodeReviewResponse");
             }
+
+            int findingCount =
+                    response.findings() == null
+                            ? 0
+                            : response.findings().size();
 
             reviewExecutionStore.save(
                     new ReviewExecution(
@@ -112,6 +152,14 @@ public class AsyncReviewExecutor {
                             ReviewStatus.COMPLETED,
                             response,
                             null));
+
+            span.tag(
+                    "review.status",
+                    "COMPLETED");
+
+            span.tag(
+                    "review.findings.count",
+                    String.valueOf(findingCount));
 
             reviewActivityPublisher.publish(
                     reviewId,
@@ -121,18 +169,25 @@ public class AsyncReviewExecutor {
             log.info(
                     "Async code review completed | reviewId={} | findings={}",
                     reviewId,
-                    response.findings() != null
-                            ? response.findings().size()
-                            : 0);
+                    findingCount);
 
         } catch (Exception e) {
+
+            span.tag(
+                    "review.status",
+                    "FAILED");
+
+            span.error(e);
+
+            String userFriendlyMessage =
+                    getUserFriendlyErrorMessage(e);
 
             reviewExecutionStore.save(
                     new ReviewExecution(
                             reviewId,
                             ReviewStatus.FAILED,
                             null,
-                            e.getMessage()));
+                            userFriendlyMessage));
 
             reviewActivityPublisher.publish(
                     reviewId,
@@ -143,6 +198,10 @@ public class AsyncReviewExecutor {
                     "Async code review failed | reviewId={}",
                     reviewId,
                     e);
+
+        } finally {
+
+            span.end();
         }
     }
 
@@ -154,8 +213,8 @@ public class AsyncReviewExecutor {
                 You are an autonomous senior Java and Spring Boot code reviewer.
 
                 Your goal is to inspect the repository using the available tools,
-                identify important code-quality or runtime risks, and return a
-                concise, evidence-based code review.
+                identify important engineering risks, and return a concise,
+                evidence-based code review.
 
                 REVIEW ID:
                 %s
@@ -170,36 +229,39 @@ public class AsyncReviewExecutor {
                 REPOSITORY TOOLS
                 ============================================================
 
-                You have repository tools available for:
+                Available tools:
 
-                - getting the repository tree
-                - listing files within a specific directory
-                - reading repository files
-                - searching source code
+                - getRepositoryTree
+                - listFiles
+                - readFile
+                - searchCode
 
-                Start by using getRepositoryTree to understand the overall
-                repository structure.
+                Start with getRepositoryTree to understand the repository.
 
-                Do not repeatedly call listFiles to walk the repository one
-                directory at a time unless additional directory inspection is
-                genuinely necessary.
+                Avoid walking the repository directory-by-directory unless
+                additional inspection is necessary.
 
-                After viewing the repository tree, select only the files that are
-                most relevant to the review.
+                Select only relevant files.
 
-                Use searchCode when you need to locate a specific class,
-                annotation, API usage, configuration value, or code pattern.
+                Use readFile for important implementation/configuration files.
 
-                Avoid reading every file in the repository.
+                Use searchCode when you need to locate:
+                - classes
+                - methods
+                - annotations
+                - configuration values
+                - exception handling
+                - specific APIs
 
-                Use the minimum number of tool calls necessary to gather
-                sufficient evidence.
+                Avoid reading every file.
+
+                Use the minimum number of tool calls necessary.
 
                 ============================================================
                 REVIEW AREAS
                 ============================================================
 
-                Review the repository for:
+                Review for:
 
                 1. Bugs and correctness issues
                 2. Potential runtime failures
@@ -217,24 +279,77 @@ public class AsyncReviewExecutor {
 
                 Do not invent issues.
 
-                Every finding must be supported by evidence discovered using
-                repository tools.
+                Every finding must be supported by repository evidence.
 
-                Only include findings with HIGH or MEDIUM confidence.
+                If evidence is insufficient, do not report the issue.
 
-                Prefer fewer high-confidence findings over speculative findings.
+                Only include HIGH or MEDIUM confidence findings.
+
+                Prefer fewer strong findings over speculative findings.
 
                 ============================================================
-                OUTPUT
+                OUTPUT LIMITS
                 ============================================================
 
-                Return at most 3 findings.
+                Return at most 2 findings.
 
-                Keep the summary concise.
+                Keep the summary under 60 words.
 
-                Return only JSON matching the required output structure.
+                For each finding:
 
-                Do not include markdown or commentary outside the JSON.
+                - issue: maximum 30 words
+                - evidence: maximum 50 words
+                - recommendation: maximum 40 words
+
+                Keep output concise.
+
+                ============================================================
+                REQUIRED FIELDS
+                ============================================================
+
+                Each finding must contain:
+
+                - severity
+                - category
+                - file
+                - line
+                - issue
+                - evidence
+                - recommendation
+                - confidence
+
+                Severity must be one of:
+
+                CRITICAL
+                HIGH
+                MEDIUM
+                LOW
+                INFO
+
+                Confidence must be one of:
+
+                HIGH
+                MEDIUM
+                LOW
+
+                ============================================================
+                OUTPUT FORMAT
+                ============================================================
+
+                Return only JSON.
+
+                Do not include markdown.
+
+                Do not wrap JSON in code fences.
+
+                Do not include commentary before or after JSON.
+
+                You MUST return a complete JSON object.
+
+                Do not stop after generating a finding.
+
+                Ensure the final response contains all required closing
+                brackets and braces.
 
                 Required output format:
 
@@ -272,5 +387,49 @@ public class AsyncReviewExecutor {
         return response.substring(
                 start,
                 end + 1);
+    }
+
+    private String getUserFriendlyErrorMessage(
+            Exception e) {
+
+        String message =
+                e.getMessage();
+
+        if (message == null
+                || message.isBlank()) {
+
+            return "Code review failed due to an unexpected error.";
+        }
+
+        String normalized =
+                message.toLowerCase();
+
+        if (message.contains("429")
+                || normalized.contains("rate limit")) {
+
+            return "AI provider rate limit exceeded. Please wait a moment and try again.";
+        }
+
+        if (normalized.contains("timeout")
+                || normalized.contains("timed out")) {
+
+            return "AI provider request timed out. Please try again.";
+        }
+
+        if (normalized.contains("api key")
+                || normalized.contains("authentication")
+                || normalized.contains("unauthorized")) {
+
+            return "AI provider authentication failed. Please check the configured API credentials.";
+        }
+
+        if (normalized.contains("json")
+                || normalized.contains("unexpected end-of-input")
+                || normalized.contains("parse")) {
+
+            return "AI returned an incomplete or invalid structured response. Please try again.";
+        }
+
+        return "Code review failed. Please check the application logs for details.";
     }
 }

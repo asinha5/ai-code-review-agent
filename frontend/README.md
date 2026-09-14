@@ -1,6 +1,6 @@
 # AI Code Review frontend
 
-A React and Vite dashboard for the asynchronous code-review backend. It starts a review, receives activities over Server-Sent Events, and falls back to polling the activities and result endpoints every five seconds if the stream cannot be maintained.
+A React and Vite dashboard for the asynchronous code-review backend. It starts a review, shows elapsed time and live activity over Server-Sent Events, and falls back to polling the activities and result endpoints every five seconds if the stream cannot be maintained.
 
 ## Run locally
 

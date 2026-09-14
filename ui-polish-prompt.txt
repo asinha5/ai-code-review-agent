@@ -1,0 +1,754 @@
+You are working ONLY in this repository:
+
+C:\Users\ASUS\OneDrive\Desktop\SelfLearningProjects\Java\ai-code-review-agent
+
+============================================================
+FIRST: VERIFY THE REPOSITORY
+============================================================
+
+Before modifying anything, run:
+
+git rev-parse --show-toplevel
+git status --short
+git log -1 --oneline
+
+Confirm:
+
+1. This is the ai-code-review-agent repository.
+2. A frontend/ directory already exists.
+3. frontend/package.json exists.
+4. frontend/src/App.jsx exists.
+5. The existing React UI is functional.
+6. The backend implementation already exists and must NOT be changed.
+
+If these checks fail:
+STOP and make no changes.
+
+============================================================
+GOAL
+============================================================
+
+Polish the EXISTING React + Vite UI for the AI Code Review Agent.
+
+This is NOT a frontend rewrite.
+
+Preserve all existing functionality:
+
+- repository path input
+- Start Review
+- async reviewId handling
+- SSE EventSource streaming
+- review-activity event handling
+- duplicate event suppression
+- fallback result polling
+- activity timeline
+- completed review result
+- findings
+- failed review handling
+- Start New Review
+- API service abstraction
+
+The current end-to-end flow has already been tested successfully.
+
+DO NOT change backend API contracts.
+
+DO NOT modify Java files.
+
+DO NOT modify pom.xml or application.yml.
+
+============================================================
+PRODUCT STYLE
+============================================================
+
+The UI should feel like a professional developer tool similar in spirit
+to GitHub, Linear, Vercel, or modern developer dashboards.
+
+Do NOT copy those products.
+
+Design principles:
+
+- clean
+- professional
+- technical
+- minimal
+- high information clarity
+- strong typography
+- subtle borders
+- restrained shadows
+- comfortable spacing
+- excellent readability
+
+Avoid:
+
+- excessive gradients
+- oversized hero sections
+- flashy animations
+- glassmorphism
+- excessive rounded cards
+- unnecessary illustrations
+- marketing-style landing-page design
+
+This is an engineering tool, not a marketing website.
+
+============================================================
+PAGE LAYOUT
+============================================================
+
+Create a clear application shell.
+
+Suggested structure:
+
+--------------------------------------------------------
+ AI Code Review Agent                     Agentic Review
+ Repository analysis powered by Spring AI
+--------------------------------------------------------
+
+ Repository
+ [ C:\path\to\repository                    ]
+                                  Start Review
+
+--------------------------------------------------------
+
+ Review
+ ID: xxxxxxxx
+ Status: RUNNING
+ Elapsed: 00:18
+
+--------------------------------------------------------
+
+ Live Agent Activity
+
+ ✓ Review Started
+ │
+ ✓ Repository Inspection
+ │
+ ✓ Reading File
+ │   SomeService.java
+ │
+ → Analyzing
+ │
+ ○ Processing Findings
+
+--------------------------------------------------------
+
+ Review Summary
+
+ ...
+
+--------------------------------------------------------
+
+ Findings
+
+ HIGH   Resource Management
+ SomeService.java : 48
+
+ FileOutputStream may leak...
+
+ Evidence
+ ...
+
+ Recommendation
+ ...
+
+ Confidence: HIGH
+
+--------------------------------------------------------
+
+Do not mechanically reproduce this layout if the existing component
+structure supports a cleaner equivalent.
+
+============================================================
+APPLICATION HEADER
+============================================================
+
+Improve the header.
+
+Show:
+
+AI Code Review Agent
+
+Subtitle:
+
+Agentic repository review powered by Spring AI
+
+Optionally add a small understated developer/AI icon using CSS or
+Unicode if appropriate.
+
+Do NOT add external icon libraries just for this.
+
+Keep header compact.
+
+============================================================
+REPOSITORY FORM
+============================================================
+
+Improve RepositoryForm.
+
+Repository Path should:
+
+- be visually prominent
+- use monospace font for the actual path
+- have good focus state
+- show placeholder clearly
+- preserve current validation
+
+Start Review button:
+
+NORMAL:
+Start Review
+
+STARTING:
+Starting Review...
+
+RUNNING:
+Review Running
+
+Disable appropriately.
+
+Add a small helper below the field:
+
+Select a local source-code repository for AI-assisted analysis.
+
+Do NOT implement a filesystem picker because browsers cannot freely
+browse arbitrary local directories.
+
+============================================================
+REVIEW STATUS
+============================================================
+
+Improve ReviewStatus.
+
+Display:
+
+Review ID
+Status
+Elapsed Time
+
+Status badges:
+
+PENDING
+RUNNING
+COMPLETED
+FAILED
+
+Make status immediately understandable.
+
+Suggested semantic presentation:
+
+PENDING    neutral
+RUNNING    active
+COMPLETED  success
+FAILED     error
+
+Do not rely ONLY on color.
+Include status text/icon/marker.
+
+For reviewId:
+
+- use monospace
+- visually de-emphasize UUID
+- optionally add a simple Copy button using navigator.clipboard
+
+If adding Copy:
+- no dependency
+- temporary "Copied" feedback
+- handle clipboard failure gracefully
+
+============================================================
+ELAPSED REVIEW TIME
+============================================================
+
+Add elapsed time while a review is active.
+
+Example:
+
+Elapsed: 00:24
+
+Use simple React state/timer logic.
+
+Start when review starts.
+
+Stop when status becomes:
+
+COMPLETED
+FAILED
+
+Clean up the interval on unmount/reset.
+
+Do not over-engineer this.
+
+============================================================
+ACTIVITY TIMELINE
+============================================================
+
+This is one of the most important parts of the product.
+
+Improve ActivityTimeline significantly.
+
+Activity types:
+
+REVIEW_STARTED
+REPOSITORY_INSPECTION
+FILE_READING
+CODE_SEARCH
+ANALYZING
+GENERATING_FINDINGS
+REVIEW_COMPLETED
+REVIEW_FAILED
+
+Map them to readable labels:
+
+REVIEW_STARTED
+→ Review Started
+
+REPOSITORY_INSPECTION
+→ Repository Inspection
+
+FILE_READING
+→ Reading File
+
+CODE_SEARCH
+→ Searching Code
+
+ANALYZING
+→ Analyzing
+
+GENERATING_FINDINGS
+→ Processing Findings
+
+REVIEW_COMPLETED
+→ Review Completed
+
+REVIEW_FAILED
+→ Review Failed
+
+Each timeline item should contain:
+
+- visual marker
+- readable label
+- message
+- local timestamp
+
+Example:
+
+● Reading File                         1:04:22 PM
+  src/main/java/.../SomeService.java
+
+Use a vertical timeline visual if it remains simple.
+
+Completed activities:
+✓
+
+Current/latest active activity:
+● or subtle spinner/pulse
+
+Failure:
+!
+
+Do NOT use heavy animation.
+
+If no events have arrived:
+
+Waiting for agent activity...
+
+============================================================
+ACTIVITY AUTO-SCROLL
+============================================================
+
+If the activity list becomes long, keep the newest activity visible.
+
+Implement simple auto-scroll only if it can be done cleanly.
+
+Do not create annoying page-level jumping.
+
+Prefer scrolling inside the timeline container.
+
+============================================================
+REVIEW SUMMARY
+============================================================
+
+Improve ReviewSummary.
+
+Show:
+
+Review Summary
+
+Then the summary text with comfortable line height.
+
+Optionally show:
+
+Findings: N
+
+Do not invent metrics not provided by backend.
+
+============================================================
+FINDINGS
+============================================================
+
+FindingCard is the second most important UI element.
+
+Improve visual hierarchy.
+
+Each finding should clearly show:
+
+SEVERITY
+
+CATEGORY
+
+FILE + LINE
+
+ISSUE
+
+EVIDENCE
+
+RECOMMENDATION
+
+CONFIDENCE
+
+Example:
+
+------------------------------------------------
+
+HIGH    Resource Management
+
+src/main/java/.../AmazonS3ClientServiceImpl.java : 48
+
+FileOutputStream resource may leak
+
+Evidence
+FileOutputStream is manually closed...
+
+Recommendation
+Use try-with-resources...
+
+Confidence: HIGH
+
+------------------------------------------------
+
+File paths should use monospace.
+
+If paths are long:
+- allow wrapping
+- do not overflow horizontally
+
+Do not hide evidence.
+
+Do not hide recommendations.
+
+============================================================
+SEVERITY VISUALS
+============================================================
+
+Support:
+
+CRITICAL
+HIGH
+MEDIUM
+LOW
+INFO
+
+Use semantic CSS classes.
+
+The badge should include severity text.
+
+Do NOT rely only on color for accessibility.
+
+Keep colors restrained.
+
+============================================================
+COMPLETED STATE
+============================================================
+
+When review status is COMPLETED:
+
+Show a clear success state:
+
+Review Completed
+
+Then:
+
+- summary
+- findings
+- Start New Review
+
+Do not use celebratory animations/confetti.
+
+============================================================
+FAILED STATE
+============================================================
+
+When FAILED:
+
+Show:
+
+Review Failed
+
+Then the backend error message.
+
+Keep the panel readable.
+
+Do NOT display huge stack traces.
+
+If error text is unusually large:
+display it safely without destroying the layout.
+
+Show:
+
+Start New Review
+
+Do not change backend error sanitization in this task.
+
+============================================================
+START NEW REVIEW
+============================================================
+
+Make Start New Review easy to find after:
+
+COMPLETED
+FAILED
+
+Existing reset behavior must remain:
+
+- close EventSource
+- stop polling
+- stop elapsed timer
+- clear reviewId
+- clear activities
+- clear result
+- clear error
+- preserve repository path
+
+============================================================
+LOADING / CONNECTION STATES
+============================================================
+
+Improve feedback for:
+
+Starting review
+Connecting to activity stream
+Waiting for activity
+Running review
+Fetching final result
+Completed
+Failed
+
+Keep wording short.
+
+Do not introduce fake progress percentages.
+
+We do not know actual review completion percentage.
+
+============================================================
+RESPONSIVE DESIGN
+============================================================
+
+Make UI work reasonably at:
+
+desktop
+tablet
+mobile
+
+Desktop is the primary target.
+
+Finding cards and timeline must not overflow.
+
+Repository path input should resize appropriately.
+
+============================================================
+ACCESSIBILITY
+============================================================
+
+Improve basic accessibility:
+
+- proper labels
+- button states
+- visible focus indicators
+- sufficient contrast
+- status text in addition to color
+- semantic headings
+- aria-live where useful for changing status
+
+Do not over-engineer accessibility infrastructure.
+
+============================================================
+CSS
+============================================================
+
+Keep using:
+
+frontend/src/styles.css
+
+Do NOT introduce:
+
+Tailwind
+Material UI
+Bootstrap
+styled-components
+CSS frameworks
+
+Use CSS variables for reusable design tokens where useful.
+
+Example categories:
+
+--background
+--surface
+--border
+--text-primary
+--text-secondary
+--success
+--warning
+--danger
+
+Do NOT create hundreds of variables.
+
+Use system fonts where appropriate.
+
+Use a monospace stack for:
+
+repository paths
+file names
+reviewId
+
+============================================================
+DO NOT BREAK SSE
+============================================================
+
+This is critical.
+
+Do NOT rewrite working EventSource behavior unless absolutely necessary.
+
+Preserve:
+
+review-activity listener
+duplicate suppression
+EventSource cleanup
+REVIEW_COMPLETED handling
+REVIEW_FAILED handling
+fallback polling
+final result retrieval
+
+UI polish must NOT alter backend orchestration behavior.
+
+============================================================
+NO NEW DEPENDENCIES UNLESS NECESSARY
+============================================================
+
+Prefer zero new dependencies.
+
+Do not add an icon library.
+
+Do not add a UI component framework.
+
+Do not add state management.
+
+Use existing React/Vite functionality.
+
+============================================================
+BEGINNER-FRIENDLY CODE
+============================================================
+
+I am primarily a Java/Spring developer learning frontend development.
+
+Keep React code understandable.
+
+Prefer:
+
+useState
+useEffect
+useRef
+
+Avoid:
+
+complex hooks
+reducers unless truly necessary
+context unless necessary
+state libraries
+clever abstractions
+
+If you add elapsed-time or clipboard behavior, keep it easy to follow.
+
+============================================================
+VERIFY EXISTING FUNCTIONALITY
+============================================================
+
+Before changing a component, inspect how it currently works.
+
+Do not replace working logic simply because you prefer another pattern.
+
+Especially inspect:
+
+App.jsx
+reviewApi.js
+ActivityTimeline.jsx
+ReviewStatus.jsx
+
+Preserve their behavioral contracts.
+
+============================================================
+DOCUMENTATION
+============================================================
+
+Update frontend/README.md only if UI behavior changed enough to
+warrant documentation.
+
+Do not rewrite root project documentation for cosmetic UI changes.
+
+============================================================
+VALIDATION
+============================================================
+
+After implementation:
+
+Run:
+
+cd frontend
+npm run build
+
+The build MUST succeed.
+
+Then from repository root run:
+
+git diff --check
+
+git status --short
+
+git diff --stat
+
+Also verify:
+
+rg -ni "redux|zustand|react-query|@tanstack|tailwind|material-ui|@mui|bootstrap" frontend --glob "!package-lock.json"
+
+There should be no prohibited UI/state dependencies.
+
+Verify:
+
+- no Java files changed
+- pom.xml unchanged
+- application.yml unchanged
+- SSE logic remains functional
+- polling remains functional
+- reset remains functional
+- no secrets introduced
+- no hardcoded personal Windows paths introduced
+
+============================================================
+FINAL RESPONSE
+============================================================
+
+When finished, report:
+
+1. Files modified
+2. UI improvements made
+3. Any behavior changes
+4. npm run build result
+5. git status --short
+6. git diff --stat
+7. Anything I should manually test
+
+IMPORTANT:
+
+DO NOT commit.
+DO NOT push.
+DO NOT create a pull request.
+
+Stop after showing the summary and wait for my approval.

@@ -6,6 +6,12 @@ spring:
     model:
       chat: anthropic
 
+    chat:
+      observations:
+        log-prompt: true
+        log-completion: true
+
+
     anthropic:
       api-key: ${ANTHROPIC_API_KEY}
       chat:
@@ -13,6 +19,23 @@ spring:
           model: claude-haiku-4-5
           temperature: 0.1
           max-tokens: 1200
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+
+  otlp:
+    tracing:
+      endpoint: ${LANGFUSE_OTEL_ENDPOINT}
+      headers:
+        Authorization: ${LANGFUSE_AUTH_HEADER}
+        x-langfuse-ingestion-version: "4"
+
+  endpoints:
+    web:
+      exposure:
+        include: health,info
 
 server:
   port: 8080

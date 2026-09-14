@@ -6,10 +6,7 @@ import ReviewSummary from './components/ReviewSummary';
 import { createActivityStream, getActivities, getReviewResult, startReview } from './services/reviewApi';
 
 const terminalStatuses = new Set(['COMPLETED', 'FAILED']);
-
-function activityKey(activity) {
-  return `${activity.timestamp}|${activity.type}|${activity.message}`;
-}
+const activityKey = (activity) => `${activity.timestamp}|${activity.type}|${activity.message}`;
 
 export default function App() {
   const [repositoryPath, setRepositoryPath] = useState('');
@@ -20,6 +17,9 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState('');
   const [isStarting, setIsStarting] = useState(false);
   const [isPolling, setIsPolling] = useState(false);
+  const [isStreamConnected, setIsStreamConnected] = useState(false);
+  const [reviewStartedAt, setReviewStartedAt] = useState(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const streamRef = useRef(null);
   const pollingRef = useRef(null);
 
@@ -65,6 +65,7 @@ export default function App() {
   const monitorReview = useCallback((id) => {
     const stream = createActivityStream(id);
     streamRef.current = stream;
+    stream.onopen = () => setIsStreamConnected(true);
     stream.addEventListener('review-activity', (event) => {
       try {
         const activity = JSON.parse(event.data);
@@ -77,12 +78,21 @@ export default function App() {
       }
     });
     stream.onerror = () => {
+      setIsStreamConnected(false);
       stream.close();
-      if (!terminalStatuses.has(status)) beginPolling(id);
+      beginPolling(id);
     };
-  }, [addActivities, beginPolling, refreshReview, status]);
+  }, [addActivities, beginPolling, refreshReview]);
 
   useEffect(() => stopMonitoring, [stopMonitoring]);
+
+  useEffect(() => {
+    if (!reviewId || terminalStatuses.has(status) || !reviewStartedAt) return undefined;
+    const updateElapsedTime = () => setElapsedSeconds(Math.floor((Date.now() - reviewStartedAt) / 1000));
+    updateElapsedTime();
+    const intervalId = window.setInterval(updateElapsedTime, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [reviewId, reviewStartedAt, status]);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -92,11 +102,14 @@ export default function App() {
     setResult(null);
     setErrorMessage('');
     setIsPolling(false);
+    setIsStreamConnected(false);
+    setElapsedSeconds(0);
     try {
       const started = await startReview(repositoryPath.trim());
       if (!started.reviewId) throw new Error('The server accepted the review but did not return a review ID.');
       setReviewId(started.reviewId);
       setStatus(started.status || 'PENDING');
+      setReviewStartedAt(Date.now());
       monitorReview(started.reviewId);
     } catch (error) {
       setReviewId(null);
@@ -115,32 +128,29 @@ export default function App() {
     setResult(null);
     setErrorMessage('');
     setIsPolling(false);
+    setIsStreamConnected(false);
+    setReviewStartedAt(null);
+    setElapsedSeconds(0);
   }
 
   const activeReview = reviewId && !terminalStatuses.has(status);
+  const elapsedTime = `${String(Math.floor(elapsedSeconds / 60)).padStart(2, '0')}:${String(elapsedSeconds % 60).padStart(2, '0')}`;
   return (
     <main className="app-shell">
-      <header className="hero">
-        <p className="eyebrow">AI-assisted engineering workflow</p>
-        <h1>Code Review Agent</h1>
-        <p>Start a review, follow the repository analysis live, and inspect actionable findings when it finishes.</p>
+      <header className="app-header">
+        <div><p className="eyebrow">Agentic repository review</p><h1>AI Code Review Agent</h1><p>Agentic repository review powered by Spring AI</p></div>
+        <span className="header-label">Agentic Review</span>
       </header>
-
-      {!reviewId ? (
-        <section className="panel start-panel">
-          <RepositoryForm repositoryPath={repositoryPath} onPathChange={setRepositoryPath} onSubmit={handleSubmit} disabled={isStarting} />
-          {errorMessage && <p className="error-message" role="alert">{errorMessage}</p>}
-        </section>
-      ) : (
-        <>
-          <ReviewStatus reviewId={reviewId} status={status} errorMessage={errorMessage} isPolling={isPolling} />
-          <ActivityTimeline activities={activities} />
-          {status === 'COMPLETED' && <ReviewSummary result={result} />}
-          <button className="new-review-button" type="button" onClick={handleNewReview} disabled={activeReview && isStarting}>
-            Start New Review
-          </button>
-        </>
-      )}
+      <section className="panel repository-panel">
+        <RepositoryForm repositoryPath={repositoryPath} onPathChange={setRepositoryPath} onSubmit={handleSubmit} isStarting={isStarting} isReviewActive={activeReview} />
+        {!reviewId && errorMessage && <p className="error-message" role="alert">{errorMessage}</p>}
+      </section>
+      {reviewId && <>
+        <ReviewStatus reviewId={reviewId} status={status} elapsedTime={elapsedTime} errorMessage={errorMessage} isPolling={isPolling} isStreamConnected={isStreamConnected} />
+        <ActivityTimeline activities={activities} />
+        {status === 'COMPLETED' && <ReviewSummary result={result} />}
+        {terminalStatuses.has(status) && <button className="new-review-button" type="button" onClick={handleNewReview}>Start New Review</button>}
+      </>}
     </main>
   );
 }
