@@ -7,6 +7,8 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.converter.BeanOutputConverter;
 import org.springframework.stereotype.Service;
+import com.aicodereview.agent.activity.ReviewActivityPublisher;
+import com.aicodereview.agent.activity.ReviewActivityType;
 
 @Service
 public class CodeReviewService {

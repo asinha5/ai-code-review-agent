@@ -1,4 +1,4 @@
-package com.aicodereview.agent.review;
+package com.aicodereview.agent.activity;
 
 import java.time.Instant;
 

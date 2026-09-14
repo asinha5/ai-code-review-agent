@@ -13,8 +13,8 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
-import com.aicodereview.agent.review.ReviewActivityPublisher;
-import com.aicodereview.agent.review.ReviewActivityType;
+import com.aicodereview.agent.activity.ReviewActivityPublisher;
+import com.aicodereview.agent.activity.ReviewActivityType;
 import com.aicodereview.agent.review.ReviewContext;
 import com.aicodereview.agent.review.ReviewContextManager;
 
