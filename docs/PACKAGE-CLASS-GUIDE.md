@@ -1,648 +1,174 @@
 # Package and Class Guide
 
-This document explains the purpose of every major class currently used by the AI Code Review Agent.
+This guide describes the classes currently present under `com.aicodereview.agent`, their responsibilities, collaborators, important methods, and reason for existing.
 
----
-
-## Package: `com.aicodereview.agent.api`
-
-The API package is the application's HTTP boundary.
-
-It translates external REST requests into calls to the application/review layer and converts internal results into HTTP responses.
+## `api`
 
 ### `CodeReviewController`
 
-**Responsibility:** Exposes review-related REST APIs.
-
-Current responsibilities:
-
-- accept a repository path
-- call `CodeReviewService`
-- return the generated `reviewId`
-- return review summary and findings
-- expose stored review activities
-
-Current endpoints:
-
-```text
-POST /api/reviews
-GET  /api/reviews/{reviewId}/activities
-```
-
-The controller should remain thin.
-
-It should not contain:
-
-- AI prompts
-- filesystem access
-- repository traversal
-- model-provider logic
-
-Future responsibility:
-
-```text
-GET /api/reviews/{reviewId}/stream
-```
-
-for Server-Sent Events.
-
----
+- **Responsibility:** HTTP boundary for starting reviews, reading stored activities, and opening SSE streams.
+- **Key collaborators:** `CodeReviewService`, `ReviewActivityStore`, and `SseReviewActivitySubscriber`.
+- **Important methods:** `review`, `getActivities`, and `streamReviewActivity` implement `POST /api/reviews`, `GET /api/reviews/{reviewId}/activities`, and `GET /api/reviews/{reviewId}/stream` respectively.
+- **Why it exists:** Keeps HTTP mapping and DTO conversion separate from review orchestration, filesystem access, and AI prompts. The class is tagged for OpenAPI, its endpoints use `@Operation`, and the stream declares `text/event-stream`.
 
 ### `CodeReviewRequest`
 
-**Type:** Java record
-
-**Responsibility:** Request DTO for starting a review.
-
-Conceptually:
-
-```java
-public record CodeReviewRequest(
-        String repositoryPath) {
-}
-```
-
-Why it exists:
-
-The API contract is separated from internal service objects.
-
----
+- **Responsibility:** Request record containing `repositoryPath`.
+- **Key collaborators:** Accepted by `CodeReviewController` and passed as a string to `CodeReviewService`.
+- **Important methods:** Record accessor `repositoryPath()`.
+- **Why it exists:** Gives the external request an explicit contract independent of domain objects.
 
 ### `CodeReviewResultResponse`
 
-**Type:** Java record
+- **Responsibility:** Response record containing `reviewId`, `summary`, and `List<CodeReviewFinding>`.
+- **Key collaborators:** Constructed by `CodeReviewController` from `CodeReviewResult`.
+- **Important methods:** Record accessors for all three fields.
+- **Why it exists:** Defines the public review response without coupling the review service to an API DTO.
 
-**Responsibility:** External API response returned after a code review.
-
-Contains:
-
-```text
-reviewId
-summary
-findings
-```
-
-Why `reviewId` matters:
-
-The frontend needs it to correlate:
-
-- review result
-- activity events
-- future SSE connection
-- future review history
-
----
-
-## Package: `com.aicodereview.agent.review`
-
-This package contains the application's review domain and orchestration logic.
-
----
+## `review`
 
 ### `CodeReviewService`
 
-**Responsibility:** Main orchestration service for a code review.
+- **Responsibility:** Orchestrates one review from context creation through the model/tool loop to structured output and lifecycle activity.
+- **Key collaborators:** `ChatClient`, `RepositoryTools`, `ReviewContextManager`, `ReviewActivityPublisher`, `BeanOutputConverter`, `CodeReviewResponse`, and `CodeReviewResult`.
+- **Important methods:** `review` validates input, creates a context, publishes lifecycle events, invokes the model with tools, extracts JSON, converts it, and returns a result. Private `buildReviewPrompt`, `validateRepositoryPath`, and `extractJson` support that flow.
+- **Why it exists:** Centralizes the use-case workflow while leaving HTTP, filesystem mechanics, context storage, and event delivery to focused components.
 
-It coordinates:
-
-```text
-request
-  |
-validate
-  |
-create review context
-  |
-build prompt
-  |
-invoke AI with tools
-  |
-receive final AI response
-  |
-convert JSON
-  |
-return structured review
-```
-
-It also publishes lifecycle activities such as:
-
-```text
-REVIEW_STARTED
-ANALYZING
-GENERATING_FINDINGS / processing findings
-REVIEW_COMPLETED
-REVIEW_FAILED
-```
-
-Important collaborators:
-
-- `ChatClient`
-- `RepositoryTools`
-- `ReviewContextManager`
-- `ReviewActivityPublisher`
-
-It should not contain raw filesystem traversal logic.
-
----
+The prompt directs the model to inspect evidence, prefer `getRepositoryTree`, minimize tool calls, produce at most three meaningful findings, and omit unsupported suspicions. `BeanOutputConverter` is best-effort conversion; `extractJson` can remove surrounding prose but cannot repair malformed or truncated JSON.
 
 ### `CodeReviewFinding`
 
-**Type:** Java record
-
-**Responsibility:** Represents one issue identified by the code review agent.
-
-Fields:
-
-```text
-severity
-category
-file
-line
-issue
-evidence
-recommendation
-confidence
-```
-
-Example conceptual finding:
-
-```text
-Severity: HIGH
-Category: Security
-File: SomeService.java
-Line: 42
-Issue: Unvalidated user-controlled path
-Evidence: ...
-Recommendation: ...
-Confidence: HIGH
-```
-
-This structure forces the model to provide actionable evidence rather than vague prose.
-
----
+- **Responsibility:** Immutable record for one finding.
+- **Key collaborators:** Contained by `CodeReviewResponse` and exposed through `CodeReviewResultResponse`.
+- **Important methods:** Accessors for `severity`, `category`, `file`, `line`, `issue`, `evidence`, `recommendation`, and `confidence`.
+- **Why it exists:** Turns free-form review prose into a stable, actionable shape with evidence and confidence.
 
 ### `CodeReviewResponse`
 
-**Type:** Java record
-
-**Responsibility:** Represents the model's structured review output.
-
-Contains:
-
-```text
-summary
-findings[]
-```
-
-This is the internal AI-output representation.
-
-It is different from `CodeReviewResultResponse`, which is the external REST response containing `reviewId`.
-
----
+- **Responsibility:** Internal model-output record containing `summary` and `findings`.
+- **Key collaborators:** Produced through `BeanOutputConverter` and wrapped by `CodeReviewResult`.
+- **Important methods:** `summary()` and `findings()`.
+- **Why it exists:** Defines the structure requested from the model independently of review identity and HTTP concerns.
 
 ### `CodeReviewResult`
 
-**Type:** Java record
-
-**Responsibility:** Internal service result combining:
-
-```text
-reviewId
-+
-CodeReviewResponse
-```
-
-Why it exists:
-
-`CodeReviewService` generates the review ID internally, but the API needs the ID as well as the AI review.
-
-Instead of coupling the service directly to an API DTO, this internal result keeps the service independent from the HTTP layer.
-
----
+- **Responsibility:** Internal service result pairing `reviewId` with `CodeReviewResponse`.
+- **Key collaborators:** Returned by `CodeReviewService` and mapped by `CodeReviewController`.
+- **Important methods:** `reviewId()` and `review()`.
+- **Why it exists:** Carries correlation identity without making the service depend on `CodeReviewResultResponse`.
 
 ### `ReviewContext`
 
-**Type:** Java record
-
-**Responsibility:** Represents the server-controlled context of one review.
-
-Contains:
-
-```text
-reviewId
-repositoryRoot
-```
-
-Example:
-
-```text
-ReviewContext
- |
- +-- reviewId: 22ac...
- +-- repositoryRoot: C:\...\project
-```
-
-The context allows tools to work with a review ID instead of trusting absolute paths generated by the LLM.
-
----
+- **Responsibility:** Immutable association between a generated `reviewId` and server-controlled `Path repositoryRoot`.
+- **Key collaborators:** Created and retrieved by `ReviewContextManager`; consumed by `RepositoryTools`.
+- **Important methods:** `reviewId()` and `repositoryRoot()`.
+- **Why it exists:** Lets tool calls use an opaque ID and relative path instead of trusting model-generated absolute paths.
 
 ### `ReviewContextManager`
 
-**Responsibility:** Creates and retrieves active review contexts.
+- **Responsibility:** Validates repository directories, normalizes roots, creates UUID review IDs, and retains contexts in a `ConcurrentHashMap`.
+- **Key collaborators:** `CodeReviewService`, `ReviewContext`, and `RepositoryTools`.
+- **Important methods:** `create(repositoryPath)` and `get(reviewId)`.
+- **Why it exists:** Makes repository authority and review correlation a server-side concern. Unknown IDs and invalid paths are rejected.
 
-Typical responsibilities:
-
-- validate the repository exists
-- verify it is a directory
-- normalize the repository root
-- generate a UUID review ID
-- store review contexts
-- retrieve context by review ID
-
-Conceptually:
-
-```text
-repositoryPath
-     |
-     v
-ReviewContextManager.create()
-     |
-     +--> UUID
-     +--> normalized Path
-     |
-     v
-ReviewContext
-```
-
-The current implementation uses in-memory state.
-
----
+## `activity`
 
 ### `ReviewActivityType`
 
-**Type:** enum
-
-**Responsibility:** Defines valid activity categories.
-
-Current values:
-
-```text
-REVIEW_STARTED
-REPOSITORY_INSPECTION
-FILE_READING
-CODE_SEARCH
-ANALYZING
-GENERATING_FINDINGS
-REVIEW_COMPLETED
-REVIEW_FAILED
-```
-
-Using an enum avoids random string event types spread through the codebase.
-
----
+- **Responsibility:** Enum of allowed activity categories.
+- **Key collaborators:** `ReviewActivityEvent`, `CodeReviewService`, `RepositoryTools`, and SSE terminal-event handling.
+- **Important values:** `REVIEW_STARTED`, `REPOSITORY_INSPECTION`, `FILE_READING`, `CODE_SEARCH`, `ANALYZING`, `GENERATING_FINDINGS`, `REVIEW_COMPLETED`, and `REVIEW_FAILED`.
+- **Why it exists:** Provides a stable event vocabulary instead of scattered string constants.
 
 ### `ReviewActivityEvent`
 
-**Type:** Java record
-
-**Responsibility:** Represents one user-visible review activity.
-
-Fields:
-
-```text
-reviewId
-type
-message
-timestamp
-```
-
-Example:
-
-```json
-{
-  "reviewId": "abc-123",
-  "type": "FILE_READING",
-  "message": "Reading file: src/main/java/.../RepositoryTools.java",
-  "timestamp": "2026-09-10T11:52:49Z"
-}
-```
-
-The timestamp uses `Instant`, which gives an unambiguous UTC timestamp. A frontend can convert it into the user's local timezone.
-
----
+- **Responsibility:** Immutable user-visible activity record with `reviewId`, `type`, `message`, and `Instant timestamp`.
+- **Key collaborators:** Created by `DefaultReviewActivityPublisher`, stored through `ReviewActivityStore`, and delivered by subscribers.
+- **Important methods:** Record accessors for its four fields.
+- **Why it exists:** Exposes observable review actions without exposing private model reasoning.
 
 ### `ReviewActivityPublisher`
 
-**Type:** interface
-
-**Responsibility:** Write/publish review activity.
-
-Contract:
-
-```text
-publish(reviewId, type, message)
-```
-
-Used by:
-
-- `CodeReviewService`
-- `RepositoryTools`
-
-Why an interface:
-
-Business code does not need to know whether an event is:
-
-- logged
-- stored
-- streamed through SSE
-- sent somewhere else later
-
----
+- **Responsibility:** Write-side contract for activity.
+- **Key collaborators:** Called by `CodeReviewService` and `RepositoryTools`; implemented by `DefaultReviewActivityPublisher`.
+- **Important method:** `publish(reviewId, type, message)`.
+- **Why it exists:** Decouples activity producers from storage, logging, SSE, and future delivery mechanisms.
 
 ### `ReviewActivityStore`
 
-**Type:** interface
-
-**Responsibility:** Read and clear stored activities.
-
-Typical methods:
-
-```text
-getActivities(reviewId)
-clear(reviewId)
-```
-
-This separates the read concern from the publish concern.
-
----
+- **Responsibility:** Contract for storing, reading, and clearing activity history by review ID.
+- **Key collaborators:** Implemented by `InMemoryReviewActivityStore`; used by the publisher, controller, and SSE subscriber.
+- **Important methods:** `store(event)`, `getActivities(reviewId)`, and `clear(reviewId)`.
+- **Why it exists:** Separates event history from publication and transport, avoiding a circular dependency and allowing storage to be replaced later.
 
 ### `DefaultReviewActivityPublisher`
 
-**Responsibility:** Current implementation of both:
+- **Responsibility:** Creates timestamped events, writes them to the store, logs them through SLF4J, and notifies registered subscribers.
+- **Key collaborators:** `ReviewActivityStore` and `List<ReviewActivitySubscriber>`.
+- **Important method:** `publish`.
+- **Why it exists:** Provides one fan-out point while callers depend only on `ReviewActivityPublisher`.
 
-```text
-ReviewActivityPublisher
-ReviewActivityStore
-```
+### `InMemoryReviewActivityStore`
 
-Current behavior when `publish()` is called:
+- **Responsibility:** Thread-safe, non-persistent activity history keyed by `reviewId`.
+- **Key collaborators:** `DefaultReviewActivityPublisher`, `CodeReviewController`, and `SseReviewActivitySubscriber` through the `ReviewActivityStore` interface.
+- **Important methods:** `store`, `getActivities`, and `clear`.
+- **Why it exists:** Gives publisher and replay consumers a neutral shared store. Its `ConcurrentHashMap` and thread-safe per-review lists support concurrent access; all data is lost on restart.
 
-```text
-create ReviewActivityEvent
-        |
-        +--> timestamp with Instant.now()
-        |
-        +--> store under reviewId
-        |
-        +--> log event
-```
+## `streaming`
 
-Storage:
+### `ReviewActivitySubscriber`
 
-```text
-ConcurrentHashMap
-    reviewId -> List<ReviewActivityEvent>
-```
+- **Responsibility:** Consumer contract for newly published activity.
+- **Key collaborators:** Invoked by `DefaultReviewActivityPublisher`; implemented by `SseReviewActivitySubscriber`.
+- **Important method:** `onActivity(event)`.
+- **Why it exists:** Keeps the publisher independent of SSE and allows additional activity consumers.
 
-A thread-safe list is used for activity entries.
+### `SseReviewActivitySubscriber`
 
-Current limitation:
+- **Responsibility:** Creates SSE subscriptions, replays stored events, pushes live events, and owns emitter lifecycle.
+- **Key collaborators:** `ReviewActivityStore`, `ReviewActivitySubscriber`, Spring `SseEmitter`, and `CodeReviewController`.
+- **Important methods:** Public `subscribe(reviewId)` and `onActivity(event)`; private helpers replay stored activities, send events, complete review emitters, remove emitters, and count subscribers.
+- **Why it exists:** Isolates HTTP streaming mechanics from review and publishing code. A `ConcurrentHashMap<String, CopyOnWriteArrayList<SseEmitter>>` permits multiple subscribers per review; timeout/error/completion callbacks clean up, while completed/failed activities close related emitters.
 
-State disappears when the application restarts.
-
-That is acceptable at this stage because persistence is not yet a requirement.
-
-Later this component can participate in live event delivery for SSE.
-
----
-
-## Package: `com.aicodereview.agent.tool`
-
-This package defines capabilities that the LLM can invoke.
-
----
+## `tool`
 
 ### `RepositoryTools`
 
-**Responsibility:** Controlled repository/file access for the AI agent.
+- **Responsibility:** Controlled repository inspection boundary exposed to the AI agent.
+- **Key collaborators:** `ReviewContextManager` resolves review scope and `ReviewActivityPublisher` reports tool actions.
+- **Why it exists:** Gives the model useful, bounded capabilities without arbitrary filesystem access.
 
-This is one of the most important classes in the application because it forms the boundary between the LLM and the developer's filesystem.
+AI-exposed methods use `@Tool`, and their parameters use descriptive `@ToolParam` annotations:
 
-Current tools:
+- `getRepositoryTree(reviewId)`: recursively returns up to the configured implementation limit of repository-relative entries, excluding ignored directories. It provides broad context in one call to reduce repeated walking and token use.
+- `listFiles(reviewId, relativePath)`: lists one repository-relative directory for targeted follow-up.
+- `readFile(reviewId, relativePath)`: reads a regular file discovered during inspection.
+- `searchCode(reviewId, searchTerm)`: searches supported text files and returns capped `relative/path:line: text` matches.
 
-### `getRepositoryTree(reviewId)`
+Internal helper methods are **not AI tools** because they have no `@Tool` annotation:
 
-Returns the repository tree recursively.
+- `resolveSecurePath`: retrieves the context, resolves and normalizes a relative path, and requires it to start with the repository root.
+- `isIgnoredPath`: excludes any path containing `.git`, `.idea`, `.vscode`, `.mvn`, `target`, `node_modules`, `build`, or `dist`.
+- `isSearchableFile`: admits `.java`, `.xml`, `.yml`, `.yaml`, `.properties`, `.md`, and `.json` files for search.
+- `findMatches`: reads a searchable file line by line and formats case-insensitive matches with repository-relative paths and line numbers.
 
-Purpose:
+## `config`
 
-- give the agent fast repository awareness
-- reduce repeated `listFiles()` calls
-- reduce token usage
+### `OpenApiConfig`
 
-Excluded directories include:
+- **Responsibility:** Supplies OpenAPI title, version, description, and supported-capability metadata.
+- **Key collaborators:** springdoc and its `OpenAPI`/`Info` models.
+- **Important method:** `codeReviewOpenApi()` bean factory.
+- **Why it exists:** Keeps API-wide documentation metadata out of controllers while enabling Swagger UI.
 
-```text
-.git
-.idea
-.vscode
-.mvn
-target
-node_modules
-build
-dist
-```
-
-It publishes:
+## Package interaction
 
 ```text
-REPOSITORY_INSPECTION
+api -> review -> Spring AI -> tool -> local repository
+          |                   |
+          +------> activity <-+
+                     |
+                     +-> in-memory store
+                     `-> streaming -> SSE clients
 ```
-
----
-
-### `listFiles(reviewId, relativePath)`
-
-Lists files/directories for a specific repository-relative directory.
-
-Useful when the model needs targeted follow-up exploration.
-
-It publishes:
-
-```text
-REPOSITORY_INSPECTION
-```
-
----
-
-### `readFile(reviewId, relativePath)`
-
-Reads the contents of a repository file.
-
-The model normally calls this after identifying an important file from the tree or search results.
-
-It publishes:
-
-```text
-FILE_READING
-```
-
----
-
-### `searchCode(reviewId, searchTerm)`
-
-Searches supported repository text files.
-
-Returns:
-
-```text
-relativePath:lineNumber: matching line
-```
-
-Example:
-
-```text
-src/main/java/.../CodeReviewService.java:64: .tools(repositoryTools)
-```
-
-It publishes:
-
-```text
-CODE_SEARCH
-```
-
-Search results are currently capped to prevent unbounded output.
-
----
-
-### `resolveSecurePath(...)`
-
-**Not an AI tool. Internal security method.**
-
-Purpose:
-
-- retrieve the repository root from the review ID
-- resolve the model-provided relative path
-- normalize the result
-- reject paths outside the repository
-
-This prevents straightforward directory traversal.
-
----
-
-### `isSearchableFile(...)`
-
-**Internal helper method.**
-
-Determines which file extensions may participate in `searchCode()`.
-
-Current supported formats:
-
-```text
-.java
-.xml
-.yml
-.yaml
-.properties
-.md
-.json
-```
-
----
-
-### `isIgnoredPath(...)`
-
-**Internal helper method.**
-
-Checks whether a path contains one of the ignored repository directories.
-
-Used during recursive traversal.
-
----
-
-### `findMatches(...)`
-
-**Internal helper method.**
-
-Reads a searchable file line-by-line and collects matching lines.
-
-It returns repository-relative file paths and line numbers to provide useful evidence to the AI.
-
-Unreadable files are skipped and logged at debug level.
-
----
-
-## How the Classes Work Together
-
-```text
-CodeReviewRequest
-       |
-       v
-CodeReviewController
-       |
-       v
-CodeReviewService
-       |
-       +----------------------+
-       |                      |
-       v                      v
-ReviewContextManager    ReviewActivityPublisher
-       |                      |
-       v                      v
- ReviewContext         ReviewActivityEvent
-       |
-       v
-    ChatClient
-       |
-       v
-      LLM
-       |
-       | native tool calls
-       v
-RepositoryTools
-       |
-       +--> getRepositoryTree
-       +--> listFiles
-       +--> readFile
-       +--> searchCode
-       |
-       +--> ReviewActivityPublisher
-       |
-       v
-local repository
-
-Final AI JSON
-       |
-       v
-CodeReviewResponse
-       |
-       v
-CodeReviewResult
-       |
-       v
-CodeReviewResultResponse
-       |
-       v
-HTTP response
-```
-
-## Design Rule of Thumb
-
-Keep these boundaries:
-
-```text
-api     = HTTP contract
-review  = review domain + orchestration
-tool    = capabilities available to the agent
-```
-
-As the project grows, new packages may later be introduced for:
-
-```text
-streaming
-observability
-configuration
-git
-mcp
-```
-
-Only add them when the responsibility actually exists.

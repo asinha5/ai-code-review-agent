@@ -1,442 +1,49 @@
 # Learning Notes
 
-## Goal of This Project
+These are practical lessons from implementing and testing the current agent.
 
-The primary purpose of this project is to understand how an agentic application works when built from first principles with Java and Spring AI.
+## Agent and tool loop
 
-The focus is not simply "call an LLM and get a code review."
+1. **A normal LLM call and an agentic call have different control flow.** A normal call is prompt to response. Here, the model can decide to call a tool, Spring AI executes it, the observation returns to the model, and the cycle repeats before the final response.
+2. **`@Tool` and `@ToolParam` describe different things.** `@Tool` exposes and describes a callable capability. `@ToolParam` explains each argument in the generated schema, such as the exact `reviewId` and repository-relative path expected.
+3. **Native tool calling depends on provider and model support.** A valid Java method is insufficient if the selected model cannot emit compatible tool calls reliably.
+4. **Schema quality affects reliability.** Specific names, descriptions, examples, constraints, and parameter guidance reduce invented IDs, wrong paths, and unnecessary calls.
+5. **Agent loops amplify token use.** Every cycle carries prompt/tool context, observations, and conversation state. One extra traversal can cost much more than one ordinary API call.
+6. **A coarse tool can be more efficient than many small tools.** `getRepositoryTree` gives initial repository awareness in one call and avoids repeated `listFiles` directory walking. The model can still follow up selectively.
 
-The focus is:
+## Repository safety and context
 
-```text
-How does an AI decide what information it needs,
-call tools,
-observe results,
-continue reasoning,
-and stop when it has enough evidence?
-```
+7. **Relative paths are safer than model-generated absolute paths.** Tools accept an opaque review ID plus a path relative to a known root.
+8. **`reviewId` preserves server-controlled context.** `ReviewContextManager` associates a generated UUID with the normalized repository root, so the model never becomes the source of authority for that root.
+9. **Normalization plus a root-prefix check enforces the boundary.** Resolve the relative path, normalize it, and require `resolved.startsWith(repositoryRoot)` before access. This rejects straightforward `..` traversal outside the review repository.
+10. **Traversal needs explicit exclusions and output limits.** Ignoring generated, dependency, IDE, and VCS directories keeps observations relevant and bounded.
 
-## 1. Agentic AI vs a Normal LLM Call
+## Providers, limits, and output
 
-A normal request looks like:
+11. **Provider experiments expose meaningful differences.** Anthropic Claude, Groq through an OpenAI-compatible integration, and earlier Ollama/Qwen local models showed different tool-calling behavior and free-tier/token constraints. The design should not assume one provider forever.
+12. **Output-token limits can truncate structured JSON.** A response that begins correctly may end before its closing braces, making conversion fail.
+13. **Input tokens per minute disappear quickly in tool loops.** Repository trees, source files, search results, schemas, and repeated context can hit rate limits even when the final answer is short.
+14. **Free tiers are valuable but shape testing.** Rate and token limits favor small prompts, capped results, deterministic local tests, and fewer intentional live-model checkpoints.
+15. **`BeanOutputConverter` is best-effort.** Its format instructions and conversion improve structure, but do not guarantee provider-native constrained output.
+16. **JSON extraction has a narrow job.** Taking text from the first `{` through the last `}` removes surrounding prose. It cannot invent missing braces, recover truncation, or validate the semantics of a finding.
+17. **No evidence means no finding.** The prompt should prefer a few high-confidence issues tied to inspected files and code over plausible but speculative advice.
 
-```text
-Prompt -> LLM -> Response
-```
+## Activity, streaming, and observability
 
-This project uses:
+18. **Activity should expose actions, not private reasoning.** “Reading `SomeService.java`” is useful and verifiable; hidden model deliberation is neither necessary nor appropriate for the UI.
+19. **SLF4J, `ReviewActivityEvent`, and Langfuse serve distinct audiences.** SLF4J is for technical application diagnostics. Activity events are user-facing progress. Planned Langfuse traces would cover model/tool execution, latency, tokens, providers, and cost where available.
+20. **Publisher/store separation avoids circular dependencies.** If the publisher both stored events and depended on an SSE subscriber that read the store, Spring could face a publisher -> subscriber -> store/publisher cycle. `InMemoryReviewActivityStore` is a neutral component shared by both.
+21. **SSE fits one-way progress.** The server needs to push activity while the browser mainly listens, so `text/event-stream` and `SseEmitter` are simpler than a bidirectional protocol.
+22. **Replay protects late subscribers.** A client may obtain or learn a `reviewId` after activity has begun. Loading stored events first preserves earlier progress, then the same connection receives live events.
+23. **One review can have multiple listeners.** A single-emitter map would replace an earlier tab. A `CopyOnWriteArrayList` per review lets all current tabs receive events, while a `ConcurrentHashMap` coordinates review IDs.
+24. **Emitter lifecycle is part of correctness.** Timeout, client error, and completion must remove emitters. `REVIEW_COMPLETED` and `REVIEW_FAILED` should complete every emitter for the affected review.
+25. **In-memory activity is intentionally temporary.** Thread-safe structures handle concurrent requests, but history resets on restart and is unsuitable for durable audit requirements.
 
-```text
-Prompt
-  |
-  v
-LLM
-  |
-  +--> getRepositoryTree
-  |       |
-  |       v
-  |    observation
-  |
-  +--> readFile
-  |       |
-  |       v
-  |    observation
-  |
-  +--> searchCode
-  |       |
-  |       v
-  |    observation
-  |
-  v
-Final structured answer
-```
+## Testing strategy
 
-The model is selecting actions dynamically.
+26. **Separate deterministic tests from paid or model-dependent tests.** Context creation, path security, repository traversal, DTO conversion boundaries, activity storage, REST mappings, replay, multiple subscribers, and cleanup can be tested without an LLM. Use live providers specifically for autonomous tool selection, schema compatibility, prompt behavior, and finding quality.
+27. **Test streaming concurrently.** Multiple `curl -N` clients attached to one review reveal replacement and cleanup mistakes that a single subscriber cannot. The current SSE replay/live flow has been exercised this way.
 
-That is the core agentic behavior being learned.
+## What comes next
 
-## 2. Tool Calling
-
-Spring AI exposes Java methods as tools using `@Tool`.
-
-Example conceptually:
-
-```java
-@Tool
-public String readFile(
-        String reviewId,
-        String relativePath) {
-    ...
-}
-```
-
-Spring AI provides the tool schema to the model.
-
-The model does not execute Java code itself.
-
-It returns a structured tool request, Spring AI executes the Java method, and the tool result is returned to the model.
-
-## 3. Tool Calling Requires Model Support
-
-An important lesson from development was that not every model behaves equally well with tool calling.
-
-Some models may output something that looks like tool JSON as normal assistant text rather than returning a proper native tool call.
-
-Spring AI needs proper tool-call metadata to execute tools automatically.
-
-Therefore:
-
-```text
-"Model can generate JSON"
-        !=
-"Model reliably supports native tool calling"
-```
-
-## 4. Tool Contracts Matter
-
-Adding detailed `@ToolParam` descriptions improved the tool contract.
-
-Important instructions include:
-
-```text
-Use exactly the supplied reviewId.
-Use repository-relative paths.
-Do not invent or modify the reviewId.
-```
-
-A tool schema should be treated like an API contract for the model.
-
-Ambiguous parameters increase model mistakes.
-
-## 5. Server-Controlled Review Context
-
-Passing absolute filesystem paths around through model calls is unnecessary and risky.
-
-The project instead creates:
-
-```text
-reviewId -> repositoryRoot
-```
-
-The model uses:
-
-```text
-reviewId + relativePath
-```
-
-The application resolves the actual path.
-
-This is a practical example of keeping security-sensitive state outside the model.
-
-## 6. Coarse-Grained Tools Can Reduce Token Usage
-
-Initially the model successfully explored:
-
-```text
-.
-src
-src/main
-src/main/java
-...
-```
-
-but each tool call adds another model/tool round trip and more context.
-
-A better tool was introduced:
-
-```text
-getRepositoryTree
-```
-
-Now the agent can:
-
-```text
-getRepositoryTree
-      |
-      v
-select important files
-      |
-      +--> readFile
-      +--> searchCode
-```
-
-Lesson:
-
-A good agent tool is not necessarily the smallest possible operation.
-
-Tool granularity should balance:
-
-- control
-- context size
-- latency
-- number of round trips
-- token consumption
-
-## 7. Agent Prompt Design
-
-The current review prompt gives the agent:
-
-- role
-- goal
-- review ID
-- tool-use guidance
-- review categories
-- evidence rules
-- severity rules
-- confidence rules
-- stop condition
-- output schema
-
-The stop condition is particularly important.
-
-Without it, an agent may continue exploring simply because more tools are available.
-
-## 8. Evidence-Based Findings
-
-The prompt explicitly tells the model:
-
-```text
-Do not invent issues.
-Every finding must be supported by evidence discovered through tools.
-Prefer fewer high-confidence findings.
-```
-
-This reduces speculative code review findings.
-
-Future work should validate these findings programmatically where possible.
-
-## 9. Structured Output
-
-Free-form prose is difficult for an API/UI to consume.
-
-The project converts model output into:
-
-```text
-CodeReviewResponse
-```
-
-with structured findings.
-
-`BeanOutputConverter` helps communicate the expected schema.
-
-A current practical fallback extracts the text between the first `{` and last `}` before conversion.
-
-Important limitation:
-
-```text
-JSON extraction can remove surrounding prose.
-It cannot repair incomplete or malformed JSON.
-```
-
-## 10. Output Token Limits Can Break Structured Responses
-
-A model response can be correct in intent but still fail if it is truncated before the closing JSON braces.
-
-This is why final-output size, token budgets, and the number of findings matter.
-
-Current prompt controls include:
-
-```text
-Return at most 3 findings.
-Keep each finding concise.
-Keep the summary concise.
-```
-
-## 11. Rate Limits Are an Architecture Concern
-
-During model testing, token-per-minute limits were reached even when individual prompts appeared reasonable.
-
-Agentic flows amplify token use because:
-
-```text
-initial prompt
- + tool schemas
- + tool result
- + next model call
- + another tool result
- + ...
-```
-
-Therefore optimization includes:
-
-- fewer tool calls
-- smaller tool results
-- targeted file reading
-- capped search results
-- concise prompts
-- concise final output
-- cheap/local deterministic tests
-
-## 12. Review Activity Is Not Chain of Thought
-
-The UI should not expose internal model reasoning.
-
-Instead, it can expose observable actions:
-
-```text
-Inspecting repository structure
-Reading SomeService.java
-Searching code for exception handling
-Processing review findings
-```
-
-These are actions the system actually performed.
-
-This is why `ReviewActivityEvent` exists.
-
-## 13. Logging and User Activity Are Different
-
-SLF4J answers:
-
-```text
-What happened technically inside the application?
-```
-
-Review activity answers:
-
-```text
-What useful progress should the user see?
-```
-
-Langfuse will later answer:
-
-```text
-What happened during the AI trace?
-How many tokens were used?
-Which tools were called?
-How long did each model invocation take?
-```
-
-Do not collapse all three into one mechanism.
-
-## 14. Interface-Based Activity Design
-
-Two interfaces were created:
-
-```text
-ReviewActivityPublisher
-ReviewActivityStore
-```
-
-This avoids coupling the agent/tool code to the eventual delivery technology.
-
-For example, `RepositoryTools` should not know anything about:
-
-```text
-SseEmitter
-HTTP
-React
-```
-
-It only publishes an activity.
-
-This is a useful application of dependency inversion.
-
-## 15. Why SSE Is Next
-
-A code review can take many seconds while the model calls tools.
-
-Without streaming:
-
-```text
-request
-...
-...
-...
-final response
-```
-
-the user sees no progress.
-
-With Server-Sent Events:
-
-```text
-Review started
-Inspecting repository
-Reading file
-Searching code
-...
-Review completed
-```
-
-can appear while work is happening.
-
-SSE is a good fit because this use case mostly requires one-way server-to-browser progress events.
-
-## 16. Cost-Aware Development
-
-The project should not call a paid or rate-limited model merely to verify deterministic plumbing.
-
-Examples that can be tested without an LLM:
-
-- Maven compilation
-- path validation
-- repository traversal
-- activity storage
-- REST endpoints
-- SSE connection lifecycle
-- DTO serialization
-
-Use a real model when validating:
-
-- autonomous tool selection
-- model/tool compatibility
-- prompt behavior
-- final finding quality
-
-This makes debugging faster and cheaper.
-
-## 17. Native Spring AI Tools Before MCP
-
-The project deliberately starts with native Spring AI tools.
-
-Reason:
-
-First understand:
-
-```text
-tool schema
-tool request
-tool execution
-tool result
-agent loop
-```
-
-Then introduce MCP and compare:
-
-```text
-native tools vs MCP
-```
-
-This makes MCP a comprehensible protocol choice rather than a black box.
-
-## 18. Current Mental Model
-
-The application can currently be thought of as five layers:
-
-```text
-1. API
-   receives review request
-
-2. Review orchestration
-   manages review lifecycle
-
-3. AI agent
-   decides actions
-
-4. Tools
-   provide controlled capabilities
-
-5. Activity / observability
-   exposes what the system is doing
-```
-
-The next layers will be:
-
-```text
-6. Streaming
-7. UI
-8. AI observability
-9. Git awareness
-10. MCP
-```
+The implemented backend now has review orchestration, tool access, structured results, activity history, and live SSE. React/Vite, Langfuse, stronger validation, provider profiles, prompt optimization/caching experiments, MCP comparison, Git-aware review, PR integration, and optional persistence remain planned.

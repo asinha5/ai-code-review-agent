@@ -1,430 +1,169 @@
 # Architecture
 
-## 1. Purpose
+## Purpose
 
-The AI Code Review Agent is designed as a learning-focused agentic application.
+The application is a tool-driven code reviewer. Instead of placing a whole repository in one prompt, it gives an LLM constrained repository capabilities and lets the model decide what evidence it needs. The final response is converted into an application-level structured result.
 
-Instead of sending an entire repository to an LLM in one prompt, the model receives a small set of repository tools and autonomously decides how to inspect the code.
-
-This makes the system genuinely tool-driven:
+## Main review flow
 
 ```text
-Goal
- |
- v
-LLM decides next action
- |
- +--> tool call
- |      |
- |      v
- |   observation
- |      |
- +------+
- |
- v
-final structured review
+Client
+  |
+  v
+CodeReviewController
+  |
+  v
+CodeReviewService
+  |
+  +--> ReviewContextManager
+  |
+  +--> ReviewActivityPublisher
+  |
+  +--> ChatClient
+           |
+           v
+          LLM
+           |
+           v
+     RepositoryTools
+           |
+           v
+     local repository
+           |
+           v
+     observations back to model
+           |
+           v
+     structured review result
 ```
 
-## 2. High-Level Architecture
+`ReviewContextManager` creates a UUID `reviewId`, normalizes the caller-supplied repository root, and retains the mapping in memory. Tool calls carry the opaque ID and repository-relative paths, keeping the authoritative root on the server.
+
+`ChatClient` uses native Spring AI tool calling. The model can autonomously call `getRepositoryTree`, `listFiles`, `readFile`, and `searchCode`, observe their results, and repeat until it can return a review. `@ToolParam` descriptions make the generated tool schema explicit. Anthropic Claude, Groq/OpenAI-compatible access, and earlier Ollama/Qwen models have been tried; provider/model support and limits influence how reliably this loop works.
+
+The review prompt requires inspected evidence, allows only a small number of meaningful findings, and assigns severity and confidence. A `BeanOutputConverter<CodeReviewResponse>` supplies the requested format and performs DTO conversion. Before conversion, the service extracts the outer JSON object defensively to remove surrounding prose; it does not attempt to repair truncated JSON.
+
+## Repository boundary
 
 ```text
-                         +-------------------+
-                         |   React UI        |
-                         |   planned         |
-                         +---------+---------+
-                                   |
-                          REST / future SSE
-                                   |
-                                   v
-                         +-------------------+
-                         | API Layer         |
-                         | CodeReviewController
-                         +---------+---------+
-                                   |
-                                   v
-                         +-------------------+
-                         | Review Layer      |
-                         | CodeReviewService |
-                         +----+----------+---+
-                              |          |
-                 creates      |          | publishes
-                 context      |          | activities
-                              v          v
-                    +---------------+   +----------------------+
-                    | ReviewContext |   | ReviewActivity       |
-                    | Manager       |   | Publisher / Store    |
-                    +-------+-------+   +----------------------+
-                            |
-                            | reviewId -> repositoryRoot
-                            |
-                            v
-                  +----------------------+
-                  | Spring AI ChatClient |
-                  +----------+-----------+
-                             |
-                             v
-                     +---------------+
-                     | LLM Provider  |
-                     +-------+-------+
-                             |
-                     native tool calls
-                             |
-                             v
-                  +----------------------+
-                  | RepositoryTools      |
-                  +----------+-----------+
-                             |
-                             v
-                  +----------------------+
-                  | Local Repository     |
-                  +----------------------+
+reviewId -> ReviewContext -> normalized repositoryRoot
+                                  |
+                                  v
+              root.resolve(relativePath).normalize()
+                                  |
+                                  v
+                     resolved.startsWith(root)
 ```
 
-## 3. API Layer
+Any path outside the repository root is rejected. Tree and search traversal exclude `.git`, `.idea`, `.vscode`, `.mvn`, `target`, `node_modules`, `build`, and `dist`.
 
-The API package owns HTTP concerns.
+`getRepositoryTree` provides a coarse-grained overview first. It was introduced to avoid repeated directory-by-directory `listFiles` calls, reducing round trips and token consumption during an agent loop. Targeted listing, reading, and searching remain available afterward.
 
-It should know about:
+## Structured result
 
-- request payloads
-- response payloads
-- path variables
-- status codes
-- future SSE endpoints
+The model returns `CodeReviewResponse` (`summary` and `findings`). Each `CodeReviewFinding` has severity, category, file, optional line, issue, evidence, recommendation, and confidence. `CodeReviewService` combines this with the generated ID in `CodeReviewResult`; the controller maps it to `CodeReviewResultResponse` for `POST /api/reviews`.
 
-It should not own:
-
-- AI prompt logic
-- repository traversal
-- file access
-- tool security
-- model orchestration
-
-This keeps the controller thin.
-
-## 4. Review / Orchestration Layer
-
-`CodeReviewService` coordinates a review.
-
-Current sequence:
+## Activity flow
 
 ```text
-validate repository path
-        |
-        v
-create ReviewContext
-        |
-        v
-publish REVIEW_STARTED
-        |
-        v
-build structured-output prompt
-        |
-        v
-publish ANALYZING
-        |
-        v
-invoke ChatClient with RepositoryTools
-        |
-        v
-model/tool loop executes
-        |
-        v
-extract final JSON
-        |
-        v
-convert to CodeReviewResponse
-        |
-        v
-publish REVIEW_COMPLETED
+CodeReviewService / RepositoryTools
+              |
+              v
+     ReviewActivityPublisher
+              |
+              v
+     ReviewActivityEvent
+              |
+              +--> InMemoryReviewActivityStore
+              |
+              +--> ReviewActivitySubscriber
+                         |
+                         v
+              SseReviewActivitySubscriber
+                         |
+                         v
+                    SseEmitter
+                         |
+                         v
+                    client/browser
 ```
 
-Any exception results in `REVIEW_FAILED`.
+The current types are `REVIEW_STARTED`, `REPOSITORY_INSPECTION`, `FILE_READING`, `CODE_SEARCH`, `ANALYZING`, `GENERATING_FINDINGS`, `REVIEW_COMPLETED`, and `REVIEW_FAILED`.
 
-The service intentionally does not directly perform filesystem operations.
+`DefaultReviewActivityPublisher` creates and logs each event, writes it through `ReviewActivityStore`, and notifies all `ReviewActivitySubscriber` implementations. `InMemoryReviewActivityStore` uses thread-safe data structures keyed by `reviewId`; it supports reading and clearing but is non-persistent and resets on application restart.
 
-## 5. Review Context
+The responsibilities are deliberately separate:
 
-A review context contains:
+- Publisher: accepts activity from review code and fans it out.
+- Store: owns historical activity independently of delivery.
+- Subscriber: consumes newly published events without coupling producers to a transport.
+- SSE delivery: manages HTTP emitters, replay, sending, and cleanup.
+
+This keeps `CodeReviewService` and `RepositoryTools` unaware of HTTP or `SseEmitter`, makes storage replaceable, and permits other subscribers later.
+
+## SSE replay and live delivery
 
 ```text
-reviewId
-repositoryRoot
+subscriber connects
+      |
+      v
+load stored activities
+      |
+      v
+replay historical events
+      |
+      v
+keep connection open
+      |
+      v
+push new events live
 ```
 
-Example:
+`GET /api/reviews/{reviewId}/stream` explicitly produces `text/event-stream`. `SseReviewActivitySubscriber` keeps a `ConcurrentHashMap` from review ID to a `CopyOnWriteArrayList<SseEmitter>`, allowing multiple clients or tabs to follow one review. Timeout, error, and normal-completion callbacks remove emitters. New activities are pushed to every active emitter, and `REVIEW_COMPLETED` or `REVIEW_FAILED` closes all emitters for that review. Replay and multi-subscriber behavior have been tested with concurrent `curl` connections.
+
+## Avoiding a circular dependency
+
+A design in which the publisher also implemented the readable store could form this Spring bean cycle:
 
 ```text
-reviewId = 22ac1541-874a-4c0f-8960-6b803636d68c
-repositoryRoot = C:\...\some-project
-```
-
-The LLM receives only the `reviewId` and relative paths when calling repository tools.
-
-This provides two benefits:
-
-1. The model does not repeatedly generate or manipulate the absolute root path.
-2. Filesystem access can be validated server-side.
-
-## 6. Tool Layer
-
-`RepositoryTools` is the controlled boundary between the AI and the local filesystem.
-
-Current tools:
-
-```text
-getRepositoryTree(reviewId)
-listFiles(reviewId, relativePath)
-readFile(reviewId, relativePath)
-searchCode(reviewId, searchTerm)
-```
-
-The tool methods are exposed to Spring AI with `@Tool`.
-
-Parameters use `@ToolParam` descriptions to make the tool contract explicit to the model.
-
-### Why `getRepositoryTree` exists
-
-Originally the agent explored repositories with multiple calls:
-
-```text
-.
-src
-src/main
-src/main/java
-...
-```
-
-This worked but consumed unnecessary model input tokens.
-
-`getRepositoryTree` provides coarse-grained discovery in one call:
-
-```text
-Repository tree
-     |
-     v
-Agent selects relevant files
-     |
-     +--> readFile
-     +--> searchCode
-```
-
-This reduces repetitive tool calls.
-
-## 7. Secure Path Resolution
-
-For file-oriented tools:
-
-```java
-repositoryRoot
-        .resolve(relativePath)
-        .normalize();
-```
-
-Then:
-
-```java
-if (!resolved.startsWith(repositoryRoot)) {
-    throw new IllegalArgumentException(...);
-}
-```
-
-Conceptually:
-
-```text
-AI asks for relative path
-        |
-        v
-server resolves path
-        |
-        v
-normalize
-        |
-        v
-inside configured root?
-     /       \
-   yes       no
-    |         |
- allow      reject
-```
-
-## 8. Structured Output
-
-The model returns a structured review rather than arbitrary prose.
-
-```text
-CodeReviewResponse
- |
- +-- summary
- |
- +-- findings[]
-       |
-       +-- severity
-       +-- category
-       +-- file
-       +-- line
-       +-- issue
-       +-- evidence
-       +-- recommendation
-       +-- confidence
-```
-
-`BeanOutputConverter<CodeReviewResponse>` supplies the expected output structure to the model and converts the final JSON into Java records.
-
-A small `extractJson()` method currently protects against responses that contain surrounding prose.
-
-It does not repair truncated or malformed JSON.
-
-## 9. Review Activity Architecture
-
-Review activity is intentionally separate from technical logging.
-
-```text
-Business / agent action
-        |
-        v
-ReviewActivityPublisher
-        |
-        v
-ReviewActivityEvent
-        |
-        +--> application log
-        |
-        +--> in-memory activity store
-        |
-        +--> future SSE subscribers
-```
-
-Current event types include:
-
-- REVIEW_STARTED
-- REPOSITORY_INSPECTION
-- FILE_READING
-- CODE_SEARCH
-- ANALYZING
-- GENERATING_FINDINGS
-- REVIEW_COMPLETED
-- REVIEW_FAILED
-
-The event message describes an observable action, not the model's private reasoning.
-
-Examples:
-
-```text
-Inspecting repository structure
-Reading file: src/main/java/.../CodeReviewService.java
-Searching code for: ChatClient
-Code review completed
-```
-
-## 10. Why Publisher and Store Are Separate Interfaces
-
-Two responsibilities are exposed:
-
-```text
-ReviewActivityPublisher
-        |
-        +--> write events
-
-ReviewActivityStore
-        |
-        +--> read / clear events
-```
-
-The current implementation supports both interfaces.
-
-This gives callers a narrow dependency:
-
-- `CodeReviewService` and `RepositoryTools` need to publish.
-- API/SSE code needs to read or subscribe.
-- Neither side needs to know the concrete implementation.
-
-## 11. Logging vs Activity Events vs Langfuse
-
-The project uses three different observability concepts.
-
-### SLF4J
-
-Purpose:
-
-- application diagnostics
-- exceptions
-- tool invocation debugging
-- developer troubleshooting
-
-### ReviewActivityEvent
-
-Purpose:
-
-- user-visible progress
-- future React activity timeline
-- concise review lifecycle events
-
-### Langfuse — planned
-
-Purpose:
-
-- AI trace
-- model invocation
-- latency
-- tool usage
-- token usage
-- errors
-- model/provider cost
-
-These should remain separate.
-
-## 12. Current State Management
-
-Current state is intentionally in memory.
-
-```text
-ReviewContextManager
-    -> active review context
-
 DefaultReviewActivityPublisher
-    -> activity events by reviewId
+  -> subscribers
+  -> SseReviewActivitySubscriber
+  -> ReviewActivityStore
+  -> DefaultReviewActivityPublisher
 ```
 
-No database is required yet.
-
-Persistence can be introduced later only when review history becomes a real requirement.
-
-## 13. Future SSE Flow
-
-Planned:
+Storage is instead an independent component:
 
 ```text
-React
- |
- | GET /api/reviews/{reviewId}/stream
- |
- v
-SseEmitter
- |
- v
-Review activity subscriber
- |
- v
-ReviewActivityPublisher
+InMemoryReviewActivityStore
+   ^                  ^
+   |                  |
+Publisher          SSE Subscriber
 ```
 
-The important architectural rule is that `RepositoryTools` should never depend directly on `SseEmitter`.
+The publisher writes history; the SSE subscriber reads it for replay. The broader lesson is to separate shared state from components that notify and consume one another.
 
-The domain publishes an activity event; transport code decides how to deliver it.
+## Observability boundaries
 
-## 14. Future MCP Direction
+- SLF4J logs are technical application diagnostics for operators and developers.
+- `ReviewActivityEvent` is a stable, user-visible description of observable actions such as reading a file; it is not private model reasoning.
+- Planned Langfuse integration would capture AI traces, tool calls, latency, token usage, provider metadata, and related diagnostics.
 
-Native Spring AI tools are being implemented first so the mechanics of tool calling are clear.
+These concerns complement one another and should not be collapsed into one event stream.
 
-Later, repository access can be exposed through MCP:
+## HTTP and OpenAPI
+
+The implemented public API is:
 
 ```text
-Current:
-LLM -> Spring AI @Tool -> RepositoryTools
-
-Future experiment:
-LLM -> MCP client -> MCP repository/filesystem server
+POST /api/reviews
+GET  /api/reviews/{reviewId}/activities
+GET  /api/reviews/{reviewId}/stream
 ```
 
-This will allow a direct comparison of native tools versus MCP rather than treating MCP as magic infrastructure.
+springdoc provides OpenAPI generation and Swagger UI. `CodeReviewController` uses `@Tag` and `@Operation`, `OpenApiConfig` supplies API metadata, and the stream mapping declares `MediaType.TEXT_EVENT_STREAM_VALUE`.
+
+## Implemented versus planned
+
+The review loop, secure tools, structured findings, activity store, REST activity access, SSE replay/live streaming, multiple subscribers, and OpenAPI documentation are implemented. The React UI, Langfuse, MCP comparison, Git-aware review, PR integration, and persistence remain planned; see [Roadmap](ROADMAP.md).

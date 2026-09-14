@@ -1,103 +1,58 @@
 # AI Code Review Agent
 
-An agentic AI learning project built with Java, Spring Boot, and Spring AI.
+An agentic AI learning project that reviews a local source repository. A Spring AI `ChatClient` lets the model select native repository tools, gather code evidence, and return a small structured set of findings. The application also records review activity and exposes it through REST and live Server-Sent Events (SSE).
 
-The application reviews a local source-code repository by allowing an LLM to autonomously inspect repository structure, read selected files, search code, and produce structured engineering findings.
+## Implemented capabilities
 
-The project is intentionally built incrementally to learn the mechanics behind agentic systems rather than hiding them behind a large agent framework.
+- Model-driven tool selection with native Spring AI tool calling
+- Server-controlled review context identified by a generated `reviewId`
+- Secure, repository-relative tree, listing, file-read, and code-search tools
+- Evidence-based findings with severity and confidence classifications
+- Structured conversion through `BeanOutputConverter`, preceded by defensive JSON extraction
+- Thread-safe, in-memory activity storage by `reviewId`
+- Stored activity retrieval and live SSE delivery, including replay, multiple subscribers, and terminal-event completion
+- springdoc OpenAPI documentation and Swagger UI
 
-## Current Goal
+Anthropic Claude, Groq through an OpenAI-compatible integration, and earlier Ollama/Qwen local-model experiments have been tested. Provider tool-calling behavior, free-tier constraints, and token limits differ, so the architecture does not assume one permanent provider.
 
-Given a local Java/Spring repository path, the application should:
-
-1. Create a review session.
-2. Give the AI access to safe repository tools.
-3. Let the AI decide which tools to call and which files to inspect.
-4. Generate concise, evidence-based findings.
-5. Track the review activity by `reviewId`.
-6. Later stream review activity live to a React UI using SSE.
-
-## Current Technology Stack
+## Technology
 
 - Java 21
 - Spring Boot 3.5.x
 - Spring AI 1.1.x
 - Maven
-- Groq through Spring AI's OpenAI-compatible integration for selected development tests
-- React + Vite planned for the UI
-- In-memory state for review context and activity tracking
-- Langfuse planned for AI observability
-- MCP planned after the native Spring AI tool-calling implementation is understood
+- Spring Web and `SseEmitter`
+- springdoc OpenAPI / Swagger UI
+- SLF4J logging
 
-## Current Architecture
+## Architecture
 
 ```text
-Client / Postman
-      |
-      v
-CodeReviewController
-      |
-      v
-CodeReviewService
-      |
-      +----> ReviewContextManager
-      |          |
-      |          +---- creates reviewId + repository root
-      |
-      +----> ReviewActivityPublisher
-      |
-      +----> Spring AI ChatClient
-                   |
-                   v
-             LLM / Agent Loop
-                   |
-                   v
-             RepositoryTools
-               |   |   |
-               |   |   +---- searchCode
-               |   +-------- readFile
-               +------------ getRepositoryTree / listFiles
-                   |
-                   v
-          Local source repository
+Client -> CodeReviewController -> CodeReviewService -> ChatClient -> LLM
+                                  |                    |
+                                  |                    v
+                                  |              RepositoryTools -> repository
+                                  v
+                          review context + activity
 ```
 
-The agent loop is conceptually:
+The service creates a review context, invokes the model with the repository tools, converts the final JSON to review DTOs, and returns `reviewId`, summary, and findings. Activities published by the service and tools are stored and pushed to any SSE subscribers.
 
-```text
-decide -> call tool -> observe result -> decide -> call tool -> ... -> final response
-```
-
-## Main Packages
+## Packages
 
 ```text
 com.aicodereview.agent
-|
-+-- api
-|   +-- CodeReviewController
-|   +-- CodeReviewRequest
-|   +-- CodeReviewResultResponse
-|
-+-- review
-|   +-- CodeReviewService
-|   +-- CodeReviewFinding
-|   +-- CodeReviewResponse
-|   +-- CodeReviewResult
-|   +-- ReviewContext
-|   +-- ReviewContextManager
-|   +-- ReviewActivityType
-|   +-- ReviewActivityEvent
-|   +-- ReviewActivityPublisher
-|   +-- ReviewActivityStore
-|   +-- DefaultReviewActivityPublisher
-|
-+-- tool
-    +-- RepositoryTools
+|-- api        HTTP request, response, activity, and streaming endpoints
+|-- review     review orchestration, context, and structured review models
+|-- activity   activity events, publishing, and in-memory storage
+|-- streaming  activity subscription and SseEmitter lifecycle
+|-- tool       repository capabilities exposed to the model
+`-- config     OpenAPI configuration
 ```
 
-See `docs/PACKAGE-CLASS-GUIDE.md` for detailed responsibilities.
+See [Package and Class Guide](docs/PACKAGE-CLASS-GUIDE.md) and [Architecture](docs/ARCHITECTURE.md).
 
-## Current REST APIs
+## REST API
 
 ### Start a review
 
@@ -106,215 +61,77 @@ POST /api/reviews
 Content-Type: application/json
 ```
 
-Example request:
+Example request on Windows:
 
 ```json
 {
-  "repositoryPath": "C:\\Users\\ASUS\\OneDrive\\Desktop\\SelfLearningProjects\\Java\\some-project"
+  "repositoryPath": "C:\\work\\sample-project"
 }
 ```
 
-The response contract contains:
+The response contains:
 
 ```json
 {
   "reviewId": "generated-review-id",
   "summary": "Concise review summary",
-  "findings": []
+  "findings": [
+    {
+      "severity": "HIGH",
+      "category": "Correctness",
+      "file": "src/main/java/example/Example.java",
+      "line": 42,
+      "issue": "Description of the issue",
+      "evidence": "Observed code evidence",
+      "recommendation": "Suggested change",
+      "confidence": "HIGH"
+    }
+  ]
 }
 ```
 
-### Read review activities
+The prompt requests at most three meaningful findings and excludes findings without inspected evidence.
+
+### Read stored activity
 
 ```http
 GET /api/reviews/{reviewId}/activities
 ```
 
-Example activity:
+### Stream activity with SSE
 
-```json
-{
-  "reviewId": "test-123",
-  "type": "ANALYZING",
-  "message": "Test activity event",
-  "timestamp": "2026-09-10T11:52:49.936684500Z"
-}
+```http
+GET /api/reviews/{reviewId}/stream
+Accept: text/event-stream
 ```
 
-## Repository Tools
-
-The model can currently use four repository tools.
-
-### `getRepositoryTree`
-
-Returns a recursive repository tree while excluding ignored directories.
-
-The prompt instructs the agent to use this first so it can understand the repository in one call rather than walking directory-by-directory.
-
-### `listFiles`
-
-Lists entries in a particular directory.
-
-This is intended for targeted follow-up inspection when the repository tree is not enough.
-
-### `readFile`
-
-Reads a repository file.
-
-The model should use it only for files that appear relevant to the review.
-
-### `searchCode`
-
-Searches supported text files for a term and returns repository-relative file paths, line numbers, and matching lines.
-
-Supported formats currently include:
-
-- `.java`
-- `.xml`
-- `.yml`
-- `.yaml`
-- `.properties`
-- `.md`
-- `.json`
-
-## Repository Safety
-
-Repository tools do not accept arbitrary absolute paths from the model.
-
-Each review has a server-created `reviewId`. The server maps that identifier to a normalized repository root.
-
-Tool paths are resolved relative to that repository root:
-
-```text
-reviewId
-   |
-   v
-ReviewContextManager
-   |
-   v
-repositoryRoot.resolve(relativePath).normalize()
+```powershell
+curl.exe -N http://localhost:8080/api/reviews/{reviewId}/stream
 ```
 
-The resolved path must still start with the configured repository root. This prevents simple path traversal attempts such as:
+On connection, the endpoint replays events already stored for the review and then streams new `ReviewActivityEvent` objects live. Multiple clients or browser tabs may subscribe to the same `reviewId`; `REVIEW_COMPLETED` or `REVIEW_FAILED` completes its emitters. This behavior has been exercised successfully with multiple concurrent `curl` subscribers.
 
-```text
-../../..
-```
+## Build and run
 
-Ignored directories include:
-
-```text
-.git
-.idea
-.vscode
-.mvn
-target
-node_modules
-build
-dist
-```
-
-## Structured Findings
-
-Each finding contains:
-
-- severity
-- category
-- file
-- line, when known
-- issue
-- evidence
-- recommendation
-- confidence
-
-The current prompt limits the model to at most three findings and asks for HIGH or MEDIUM confidence findings only.
-
-## Review Activity Tracking
-
-The application now records user-visible review activity such as:
-
-```text
-REVIEW_STARTED
-ANALYZING
-REPOSITORY_INSPECTION
-FILE_READING
-CODE_SEARCH
-GENERATING_FINDINGS
-REVIEW_COMPLETED
-REVIEW_FAILED
-```
-
-These events are separate from normal application logs.
-
-Current flow:
-
-```text
-CodeReviewService / RepositoryTools
-              |
-              v
-     ReviewActivityPublisher
-              |
-              v
-DefaultReviewActivityPublisher
-              |
-              +---- logs the event
-              |
-              +---- stores event in memory by reviewId
-```
-
-The next step is to stream these events to the frontend using Server-Sent Events (SSE).
-
-## Build
-
-```bash
+```powershell
 mvn clean compile -DskipTests
+mvn spring-boot:run
 ```
 
-## Current Development Strategy
+Swagger UI is available while the application is running at:
 
-The project intentionally separates cheap deterministic development from model-dependent testing.
+```text
+http://localhost:8080/swagger-ui.html
+```
 
-Use local compilation and deterministic tests for:
+Provider credentials and model selection must be supplied through the application's environment/configuration; do not commit secrets.
 
-- controllers
-- review context
-- path security
-- activity storage
-- SSE
-- DTOs
-- repository tools
+## Current limitations
 
-Use a live LLM only for meaningful agent-loop checkpoints.
+- Review contexts and activities are in memory and disappear on restart.
+- Reviews currently target a supplied local repository path, not a Git diff or GitHub pull request.
+- Model output conversion is best-effort; prose can be stripped around JSON, but truncated or malformed JSON cannot be repaired.
+- Provider rate limits, token limits, and tool-calling support affect review behavior.
+- There is no frontend, durable history, Langfuse tracing, or centralized exception mapping yet.
 
-This keeps development cost low and makes failures easier to isolate.
-
-## Current Status
-
-Completed:
-
-- Spring Boot project setup
-- Spring AI integration
-- Native Spring AI tool calling
-- Secure repository context
-- Repository tree inspection
-- File reading and code searching
-- Structured code review response
-- Review ID returned through API
-- Review activity model
-- Tool-level activity publishing
-- In-memory activity store
-- REST endpoint to read activities
-
-Next:
-
-- SSE live activity streaming
-- React + Vite UI
-- Langfuse observability
-- stronger validation and error handling
-- prompt/token optimization
-- optional prompt caching
-- MCP implementation
-- Git diff / pull request awareness
-- optional persistence and multi-agent experimentation
-
-See `docs/ROADMAP.md` for the planned progression.
+Implemented and planned work are separated in the [Roadmap](docs/ROADMAP.md).
