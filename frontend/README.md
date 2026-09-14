@@ -1,10 +1,10 @@
 # AI Code Review frontend
 
-A React and Vite dashboard for the asynchronous code-review backend. It starts a review, shows elapsed time and live activity over Server-Sent Events, and falls back to polling the activities and result endpoints every five seconds if the stream cannot be maintained.
+This React + Vite dashboard starts and follows asynchronous reviews from the Spring Boot backend. REST starts reviews and retrieves stored state; SSE delivers live `review-activity` events; five-second polling is the fallback when the browser cannot maintain its EventSource connection.
 
 ## Run locally
 
-Start the Spring Boot backend on port `8080`, then run:
+Start the backend at `http://localhost:8080`, then run:
 
 ```powershell
 cd frontend
@@ -12,7 +12,13 @@ npm install
 npm run dev
 ```
 
-Vite serves the frontend at `http://localhost:5173` and proxies `/api` requests to `http://localhost:8080`.
+Vite serves the frontend at `http://localhost:5173` and proxies `/api` to `http://localhost:8080`.
+
+Build a production bundle with:
+
+```powershell
+npm run build
+```
 
 ## Optional deployment configuration
 

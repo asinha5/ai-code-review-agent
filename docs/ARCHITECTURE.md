@@ -1,169 +1,57 @@
 # Architecture
 
-## Purpose
+The application reviews a local repository asynchronously. The browser receives a review ID immediately, follows operational activity through SSE, and reads the stored execution result when the review reaches a terminal state.
 
-The application is a tool-driven code reviewer. Instead of placing a whole repository in one prompt, it gives an LLM constrained repository capabilities and lets the model decide what evidence it needs. The final response is converted into an application-level structured result.
-
-## Main review flow
-
-```text
-Client
-  |
-  v
-CodeReviewController
-  |
-  v
-CodeReviewService
-  |
-  +--> ReviewContextManager
-  |
-  +--> ReviewActivityPublisher
-  |
-  +--> ChatClient
-           |
-           v
-          LLM
-           |
-           v
-     RepositoryTools
-           |
-           v
-     local repository
-           |
-           v
-     observations back to model
-           |
-           v
-     structured review result
+```mermaid
+flowchart TD
+  UI[React + Vite] -->|POST /api/reviews| Controller[CodeReviewController]
+  Controller --> Service[CodeReviewService]
+  Service --> Context[ReviewContextManager]
+  Service --> Executions[ReviewExecutionStore]
+  Service --> Executor[AsyncReviewExecutor]
+  Executor --> AI[Spring AI / Claude]
+  AI --> Tools[RepositoryTools]
+  Tools --> Repo[Repository tree / list / read / search]
+  Executor --> Activities[ReviewActivityPublisher]
+  Tools --> Activities
+  Activities --> ActivityStore[ReviewActivityStore]
+  Activities --> SSE[SseReviewActivitySubscriber]
+  SSE -->|review-activity events| UI
+  Executor --> Executions
+  UI -->|GET result| Controller
+  Controller --> Executions
+  Executor --> Tracing[ReviewTracingService]
+  Tracing --> Micrometer[Micrometer / OpenTelemetry]
+  Micrometer --> OTLP[OTLP]
+  OTLP --> Langfuse[Langfuse]
 ```
 
-`ReviewContextManager` creates a UUID `reviewId`, normalizes the caller-supplied repository root, and retains the mapping in memory. Tool calls carry the opaque ID and repository-relative paths, keeping the authoritative root on the server.
+## Review lifecycle
 
-`ChatClient` uses native Spring AI tool calling. The model can autonomously call `getRepositoryTree`, `listFiles`, `readFile`, and `searchCode`, observe their results, and repeat until it can return a review. `@ToolParam` descriptions make the generated tool schema explicit. Anthropic Claude, Groq/OpenAI-compatible access, and earlier Ollama/Qwen models have been tried; provider/model support and limits influence how reliably this loop works.
+`CodeReviewService` validates the supplied directory, creates a `ReviewContext`, stores a `PENDING` `ReviewExecution`, publishes `REVIEW_STARTED`, and returns the generated ID. `AsyncReviewExecutor.execute` is annotated with `@Async`; it records `RUNNING`, asks the Spring AI `ChatClient` to call repository tools as needed, converts the final JSON into `CodeReviewResponse`, then stores either `COMPLETED` or `FAILED`.
 
-The review prompt requires inspected evidence, allows only a small number of meaningful findings, and assigns severity and confidence. A `BeanOutputConverter<CodeReviewResponse>` supplies the requested format and performs DTO conversion. Before conversion, the service extracts the outer JSON object defensively to remove surrounding prose; it does not attempt to repair truncated JSON.
+The result endpoint exposes `ReviewExecution`, whose status is one of `PENDING`, `RUNNING`, `COMPLETED`, or `FAILED`. A completed execution carries the review result; a failed one carries a user-friendly error message.
 
 ## Repository boundary
 
-```text
-reviewId -> ReviewContext -> normalized repositoryRoot
-                                  |
-                                  v
-              root.resolve(relativePath).normalize()
-                                  |
-                                  v
-                     resolved.startsWith(root)
-```
+`ReviewContextManager` maps a UUID to a normalized repository root. `RepositoryTools` receives the review ID and repository-relative paths, resolves paths through that server-owned context, and rejects paths outside the root. It excludes common generated and tooling directories such as `.git`, `target`, `node_modules`, `build`, and `dist`.
 
-Any path outside the repository root is rejected. Tree and search traversal exclude `.git`, `.idea`, `.vscode`, `.mvn`, `target`, `node_modules`, `build`, and `dist`.
+## Activity and streaming
 
-`getRepositoryTree` provides a coarse-grained overview first. It was introduced to avoid repeated directory-by-directory `listFiles` calls, reducing round trips and token consumption during an agent loop. Targeted listing, reading, and searching remain available afterward.
+`AsyncReviewExecutor` and `RepositoryTools` publish `ReviewActivityEvent` records through `ReviewActivityPublisher`. `DefaultReviewActivityPublisher` timestamps, stores, logs, and fans each event out to subscribers. `InMemoryReviewActivityStore` retains activity by review ID for the process lifetime.
 
-## Structured result
+`SseReviewActivitySubscriber` replays existing events to a newly connected `SseEmitter`, then forwards live events named `review-activity`. It supports multiple emitters for one review and removes them on completion, timeout, error, or terminal review activity. The React UI de-duplicates replayed/live events and falls back to five-second polling if its EventSource closes.
 
-The model returns `CodeReviewResponse` (`summary` and `findings`). Each `CodeReviewFinding` has severity, category, file, optional line, issue, evidence, recommendation, and confidence. `CodeReviewService` combines this with the generated ID in `CodeReviewResult`; the controller maps it to `CodeReviewResultResponse` for `POST /api/reviews`.
+| Mechanism | Purpose |
+| --- | --- |
+| `ReviewActivityEvent` | User-facing operational progress, such as file reads and completion. |
+| SLF4J | Application and developer diagnostics. |
+| Langfuse | AI/agent observability: spans, model observations, provider metadata, and telemetry where available. |
 
-## Activity flow
+## Observability
 
-```text
-CodeReviewService / RepositoryTools
-              |
-              v
-     ReviewActivityPublisher
-              |
-              v
-     ReviewActivityEvent
-              |
-              +--> InMemoryReviewActivityStore
-              |
-              +--> ReviewActivitySubscriber
-                         |
-                         v
-              SseReviewActivitySubscriber
-                         |
-                         v
-                    SseEmitter
-                         |
-                         v
-                    client/browser
-```
+Actuator supplies the tracing infrastructure. Micrometer’s OpenTelemetry bridge provides the injected `Tracer`; the OTLP exporter sends traces to the endpoint configured by `LANGFUSE_OTEL_ENDPOINT` with `LANGFUSE_AUTH_HEADER`.
 
-The current types are `REVIEW_STARTED`, `REPOSITORY_INSPECTION`, `FILE_READING`, `CODE_SEARCH`, `ANALYZING`, `GENERATING_FINDINGS`, `REVIEW_COMPLETED`, and `REVIEW_FAILED`.
+`ReviewTracingService` starts an `ai-code-review` span tagged with `review.id` and repository name. `AsyncReviewExecutor` adds terminal status and finding-count tags, and records failures on the span. Spring AI produces model observations; `ChatModelCompletionContentObservationFilter` maps available request instructions and response completions to `langfuse.observation.input` and `langfuse.observation.output`. Model, token, and latency information is visible when Spring AI, the provider, and the telemetry pipeline supply it.
 
-`DefaultReviewActivityPublisher` creates and logs each event, writes it through `ReviewActivityStore`, and notifies all `ReviewActivitySubscriber` implementations. `InMemoryReviewActivityStore` uses thread-safe data structures keyed by `reviewId`; it supports reading and clearing but is non-persistent and resets on application restart.
-
-The responsibilities are deliberately separate:
-
-- Publisher: accepts activity from review code and fans it out.
-- Store: owns historical activity independently of delivery.
-- Subscriber: consumes newly published events without coupling producers to a transport.
-- SSE delivery: manages HTTP emitters, replay, sending, and cleanup.
-
-This keeps `CodeReviewService` and `RepositoryTools` unaware of HTTP or `SseEmitter`, makes storage replaceable, and permits other subscribers later.
-
-## SSE replay and live delivery
-
-```text
-subscriber connects
-      |
-      v
-load stored activities
-      |
-      v
-replay historical events
-      |
-      v
-keep connection open
-      |
-      v
-push new events live
-```
-
-`GET /api/reviews/{reviewId}/stream` explicitly produces `text/event-stream`. `SseReviewActivitySubscriber` keeps a `ConcurrentHashMap` from review ID to a `CopyOnWriteArrayList<SseEmitter>`, allowing multiple clients or tabs to follow one review. Timeout, error, and normal-completion callbacks remove emitters. New activities are pushed to every active emitter, and `REVIEW_COMPLETED` or `REVIEW_FAILED` closes all emitters for that review. Replay and multi-subscriber behavior have been tested with concurrent `curl` connections.
-
-## Avoiding a circular dependency
-
-A design in which the publisher also implemented the readable store could form this Spring bean cycle:
-
-```text
-DefaultReviewActivityPublisher
-  -> subscribers
-  -> SseReviewActivitySubscriber
-  -> ReviewActivityStore
-  -> DefaultReviewActivityPublisher
-```
-
-Storage is instead an independent component:
-
-```text
-InMemoryReviewActivityStore
-   ^                  ^
-   |                  |
-Publisher          SSE Subscriber
-```
-
-The publisher writes history; the SSE subscriber reads it for replay. The broader lesson is to separate shared state from components that notify and consume one another.
-
-## Observability boundaries
-
-- SLF4J logs are technical application diagnostics for operators and developers.
-- `ReviewActivityEvent` is a stable, user-visible description of observable actions such as reading a file; it is not private model reasoning.
-- Planned Langfuse integration would capture AI traces, tool calls, latency, token usage, provider metadata, and related diagnostics.
-
-These concerns complement one another and should not be collapsed into one event stream.
-
-## HTTP and OpenAPI
-
-The implemented public API is:
-
-```text
-POST /api/reviews
-GET  /api/reviews/{reviewId}/activities
-GET  /api/reviews/{reviewId}/stream
-```
-
-springdoc provides OpenAPI generation and Swagger UI. `CodeReviewController` uses `@Tag` and `@Operation`, `OpenApiConfig` supplies API metadata, and the stream mapping declares `MediaType.TEXT_EVENT_STREAM_VALUE`.
-
-## Implemented versus planned
-
-The review loop, secure tools, structured findings, activity store, REST activity access, SSE replay/live streaming, multiple subscribers, and OpenAPI documentation are implemented. The React UI, Langfuse, MCP comparison, Git-aware review, PR integration, and persistence remain planned; see [Roadmap](ROADMAP.md).
+Prompt/completion observation is sensitive. It may export prompts, model responses, source-code excerpts, and findings or evidence to the configured telemetry backend. The application currently enables Spring AI prompt/completion logging, so configure access and retention deliberately.
